@@ -48,13 +48,13 @@ uma-serve/
 
 **Daemon + model lifecycle**
 
-* [ ] `RuntimeConfig` loader (YAML/env/flags; minimal in W1).
-* [ ] `ModelHandle` (RAII)
+* [x] `RuntimeConfig` loader (YAML/env/flags; minimal in W1).
+* [x] `ModelHandle` (RAII)
 
-  * [ ] `llama_model* load(const std::string& path)` once in parent.
-  * [ ] `llama_context_params` baseline (Metal/Vulkan auto).
-  * [ ] Persistent allocator pools enabled (llama.cpp flags).
-* [ ] Graceful signal handling (SIGINT/SIGTERM) → drain & shutdown.
+  * [x] `llama_model* load(const std::string& path)` once in parent.
+  * [x] `llama_context_params` baseline (Metal/Vulkan auto).
+  * [x] Persistent allocator pools enabled (llama.cpp flags).
+* [x] Graceful signal handling (SIGINT/SIGTERM) → drain & shutdown.
 
 **UDS server (macOS first)**
 
@@ -71,7 +71,7 @@ uma-serve/
 
 **Build & run**
 
-* [ ] CMake target `umad`; RelWithDebInfo; LTO off initially.
+* [x] CMake target `umad`; RelWithDebInfo; LTO off initially.
 * [ ] `scripts/run_dev.sh` (sets `LLAMA_*` env if needed).
 
 **Acceptance (M1)**

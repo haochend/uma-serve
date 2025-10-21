@@ -15,7 +15,11 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE INTERNAL "")
 add_subdirectory(external/llama.cpp)
 
 # --- 4. Define YOUR Executable (umad) ---
-add_executable(umad src/main.cpp)
+add_executable(umad
+    src/umad/main.cpp
+    src/runtime/config.cpp
+    src/runtime/model.cpp
+)
 
 # --- 5. Link Your Server to the Engine ---
 #
@@ -28,3 +32,6 @@ add_executable(umad src/main.cpp)
 # against the system Metal frameworks.
 #
 target_link_libraries(umad PRIVATE llama)
+
+# Make internal headers importable as "runtime/..."
+target_include_directories(umad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
