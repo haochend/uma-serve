@@ -56,11 +56,14 @@ def start_daemon(model, sock_path, n_ctx=None, threads=None):
     raise TimeoutError("timed out waiting for UDS to be ready")
 
 
-def uds_request(sock_path, prompt, timeout=60):
+def uds_request(sock_path, prompt, timeout=60, raw_bytes: bytes | None = None):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         s.connect(sock_path)
-        s.sendall((prompt + "\n").encode("utf-8"))
+        if raw_bytes is not None:
+            s.sendall(raw_bytes)
+        else:
+            s.sendall((prompt + "\n").encode("utf-8"))
         chunks = []
         start = time.time()
         while True:
@@ -86,12 +89,13 @@ def test_basic(sock_path):
 
 
 def test_multi_clients(sock_path):
-    results = [None, None, None]
+    # 4 concurrent clients as per M2 acceptance
+    results = [None, None, None, None]
 
     def worker(i):
         results[i] = uds_request(sock_path, f"Client {i}", timeout=90)
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(len(results))]
     for t in threads:
         t.start()
     for t in threads:
@@ -119,6 +123,44 @@ def test_reuse_session(sock_path):
             assert len(out) > 0 and out.endswith(b"\n"), "session reuse response invalid"
 
 
+def get_rss_kib(pid: int) -> int:
+    try:
+        out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)], text=True).strip()
+        return int(out)
+    except Exception:
+        return -1
+
+
+def test_rss_stability(sock_path, pid: int):
+    # Measure RSS across repeated prompts on a single session (after warm-up)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(60)
+        s.connect(sock_path)
+        # warm-up
+        s.sendall(b"warm up\n")
+        s.recv(4096)
+        rss_samples = []
+        for i in range(3):
+            s.sendall(f"measure {i}\n".encode("utf-8"))
+            # read until newline
+            chunks = []
+            while True:
+                data = s.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+                if b"\n" in data:
+                    break
+            rss_kib = get_rss_kib(pid)
+            if rss_kib > 0:
+                rss_samples.append(rss_kib)
+            time.sleep(0.3)
+        if len(rss_samples) >= 2:
+            drift = max(rss_samples) - min(rss_samples)
+            # allow modest drift (e.g., 64 MiB) due to allocator/Metal behavior
+            assert drift < 64 * 1024, f"RSS drift too high: {drift} KiB"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=False, default=os.environ.get("UMA_MODEL"))
@@ -139,6 +181,9 @@ def main():
         test_basic(sock_path)
         test_multi_clients(sock_path)
         test_reuse_session(sock_path)
+        test_rss_stability(sock_path, proc.pid)
+        test_oversize(sock_path)
+        test_invalid_utf8(sock_path)
         print("M1/M2 smoke tests: PASS")
         return 0
     except Exception as e:
@@ -161,6 +206,15 @@ def main():
             pass
 
 
+def test_oversize(sock_path):
+    big = b"A" * 9000 + b"\n"
+    out = uds_request(sock_path, "", raw_bytes=big, timeout=30)
+    assert b"error: prompt too large" in out, "expected oversize error"
+
+
+def test_invalid_utf8(sock_path):
+    bad = b"\xC0bad\n"
+    out = uds_request(sock_path, "", raw_bytes=bad, timeout=30)
+    assert b"error: invalid utf-8" in out, "expected utf-8 error"
 if __name__ == "__main__":
     sys.exit(main())
-

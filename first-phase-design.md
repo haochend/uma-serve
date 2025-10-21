@@ -110,12 +110,12 @@ uma-serve/
 
 * [x] Configurable caps: max sessions, max prompt bytes, max tokens.
 * [x] Idle timeout (e.g., 5 min).
-* [ ] Input parser guards (UTF-8, reasonable JSON size later).
+* [x] Input parser guards (UTF-8, reasonable JSON size later).
 
 **Acceptance (M2)**
 
-* [ ] 4 terminals connect simultaneously; sequential compute is okay.
-* [ ] No crashes/leaks (`leaks`, `Activity Monitor` RSS flat except contexts).
+* [x] 4 terminals connect simultaneously; sequential compute is okay.
+* [x] No crashes/leaks (`leaks`, `Activity Monitor` RSS flat except contexts).
 
 ---
 

@@ -48,6 +48,40 @@ namespace {
                   << "Usage: umad --model /path/model.gguf [--n-ctx 4096] [--threads N] [--mlock] [--{no-}mmap] [--socket /tmp/uma.sock]\n\n"
                   << "Env: UMA_MODEL, UMA_N_CTX, UMA_THREADS, UMA_USE_MMAP, UMA_USE_MLOCK, UMA_SOCK\n";
     }
+
+    // Validate basic UTF-8 correctness (reject overlong & invalid ranges)
+    bool is_valid_utf8(const std::string &s) {
+        unsigned int remaining = 0;
+        unsigned char lead = 0;
+        unsigned int pos = 0;
+        for (unsigned char c : s) {
+            if (remaining == 0) {
+                if (c <= 0x7F) {
+                    continue;
+                } else if (c >= 0xC2 && c <= 0xDF) {
+                    remaining = 1; lead = c; pos = 0;
+                } else if (c >= 0xE0 && c <= 0xEF) {
+                    remaining = 2; lead = c; pos = 0;
+                } else if (c >= 0xF0 && c <= 0xF4) {
+                    remaining = 3; lead = c; pos = 0;
+                } else {
+                    return false; // overlong leads C0/C1 or > F4
+                }
+            } else {
+                if ((c & 0xC0) != 0x80) return false;
+                ++pos;
+                if (pos == 1) {
+                    // first continuation has extra constraints for some leads
+                    if (lead == 0xE0 && c < 0xA0) return false;      // overlong 3-byte
+                    if (lead == 0xED && c > 0x9F) return false;      // UTF-16 surrogate
+                    if (lead == 0xF0 && c < 0x90) return false;      // overlong 4-byte
+                    if (lead == 0xF4 && c > 0x8F) return false;      // > U+10FFFF
+                }
+                if (--remaining == 0) { lead = 0; pos = 0; }
+            }
+        }
+        return remaining == 0;
+    }
 }
 
 int main(int argc, char** argv) {
@@ -195,17 +229,45 @@ int main(int argc, char** argv) {
                         close_session(fd);
                         continue;
                     }
+                    // Enforce size cap before buffering more
+                    if (s.rx.size() + (size_t)n > cfg.max_prompt_bytes) {
+                        // queue error and close after flush
+                        const std::string msg = "error: prompt too large (limit " + std::to_string(cfg.max_prompt_bytes) + ")\n";
+                        s.tx.insert(s.tx.end(), msg.begin(), msg.end());
+                        s.state = uma::ipc::SessionState::ERRORED;
+                        // stop reading more
+                        reg_ev(fd, EVFILT_READ, EV_DELETE);
+                        // enable write to flush error
+                        reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                        continue;
+                    }
                     s.rx.insert(s.rx.end(), buf, buf + n);
                     s.last_activity_ns = now_ns();
-                    if (s.rx.size() > cfg.max_prompt_bytes) {
-                        s.last_error = "prompt too large";
-                        s.state = uma::ipc::SessionState::ERRORED;
-                    }
                     // Check for newline-terminated prompt
                     auto nl = std::find(s.rx.begin(), s.rx.end(), (uint8_t) '\n');
                     if (nl != s.rx.end()) {
                         std::string prompt(s.rx.begin(), nl);
                         s.rx.erase(s.rx.begin(), nl + 1);
+                        // trim trailing CR
+                        if (!prompt.empty() && prompt.back() == '\r') prompt.pop_back();
+                        // reject embedded NUL
+                        if (prompt.find('\0') != std::string::npos) {
+                            const std::string emsg = "error: invalid input (NUL)\n";
+                            s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
+                            s.state = uma::ipc::SessionState::ERRORED;
+                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                            reg_ev(fd, EVFILT_READ, EV_DELETE);
+                            continue;
+                        }
+                        // UTF-8 validation
+                        if (!is_valid_utf8(prompt)) {
+                            const std::string emsg = "error: invalid utf-8\n";
+                            s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
+                            s.state = uma::ipc::SessionState::ERRORED;
+                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                            reg_ev(fd, EVFILT_READ, EV_DELETE);
+                            continue;
+                        }
                         // run generation synchronously (sequential compute OK in M2)
                         try {
                             (void)uma::runtime::generate_greedy_stream(
@@ -220,6 +282,9 @@ int main(int argc, char** argv) {
                         } catch (...) {
                             s.last_error = "generation error";
                             s.state = uma::ipc::SessionState::ERRORED;
+                            const std::string emsg = "error: generation failed\n";
+                            s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
+                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
                         }
                     }
                 } else if (ev.filter == EVFILT_WRITE) {
@@ -240,6 +305,10 @@ int main(int argc, char** argv) {
                     if (s.tx.empty()) {
                         // done streaming, stop write notifications
                         reg_ev(fd, EVFILT_WRITE, EV_DELETE);
+                        if (s.state == uma::ipc::SessionState::ERRORED) {
+                            // close errored sessions after flushing error
+                            close_session(fd);
+                        }
                         // keep connection open for now to allow multiple prompts per session
                     }
                 }
