@@ -4,6 +4,7 @@
 #include "runtime/model.h"
 #include "runtime/infer.h"
 #include "ipc/uds_server.h"
+#include "ipc/session.h"
 
 #include "llama.h"
 
@@ -14,6 +15,11 @@
 #include <stdexcept>
 #include <thread>
 #include <unistd.h>
+#include <sys/event.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <cerrno>
 
 using uma::runtime::RuntimeConfig;
 using uma::runtime::LlamaBackendGuard;
@@ -94,57 +100,164 @@ int main(int argc, char** argv) {
                   << " n_threads=" << cfg.n_threads
                   << "\n";
 
-        // UDS server (single-client blocking, newline-terminated prompt)
+        // UDS server (kqueue, multi-client)
         uma::ipc::UDSServer server(cfg.socket_path, cfg.socket_mode);
+        if (!server.open_listen()) {
+            std::cerr << "Failed to open UDS listen socket\n";
+            return 2;
+        }
 
-        auto handler = [&](int cfd) {
-            // Read until newline
-            std::string prompt;
-            char buf[1024];
-            while (true) {
-                ssize_t n = ::read(cfd, buf, sizeof(buf));
-                if (n <= 0) break;
-                prompt.append(buf, buf + n);
-                auto pos = prompt.find('\n');
-                if (pos != std::string::npos) {
-                    prompt.resize(pos); // strip newline
-                    break;
-                }
-                // keep reading until newline or EOF
-            }
+        int kq = ::kqueue();
+        if (kq < 0) {
+            std::perror("kqueue");
+            return 2;
+        }
 
-            if (prompt.empty()) {
-                return; // nothing to do
-            }
-
-            auto write_all = [&](const char* p, size_t nbytes) {
-                const char* pcur = p;
-                size_t left = nbytes;
-                while (left > 0) {
-                    ssize_t w = ::write(cfd, pcur, left);
-                    if (w <= 0) return false;
-                    left -= static_cast<size_t>(w);
-                    pcur += w;
-                }
-                return true;
-            };
-
-            // Generate and stream pieces as raw bytes
-            try {
-                (void)uma::runtime::generate_greedy_stream(
-                    admin_ctx.get(), model.get(), prompt, /*max_new_tokens*/256,
-                    [&](const char* data, size_t len){
-                        (void) write_all(data, len);
-                    }
-                );
-            } catch (const std::exception& e) {
-                std::string msg = std::string("error: ") + e.what() + "\n";
-                (void) write_all(msg.c_str(), msg.size());
+        auto reg_ev = [&](int fd, int16_t filter, uint16_t flags) {
+            struct kevent kev;
+            EV_SET(&kev, fd, filter, flags, 0, 0, nullptr);
+            if (::kevent(kq, &kev, 1, nullptr, 0, nullptr) < 0) {
+                std::perror("kevent(reg)");
             }
         };
 
+        // register listen fd for read
+        reg_ev(server.fd(), EVFILT_READ, EV_ADD);
+
+        // session pool
+        uma::ipc::SessionPool sessions;
+
+        auto now_ns = [](){
+            using namespace std::chrono;
+            return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+        };
+
+        auto close_session = [&](int cfd){
+            auto it = sessions.find(cfd);
+            if (it != sessions.end()) {
+                if (it->second->ctx) llama_free(it->second->ctx);
+                ::close(cfd);
+                sessions.erase(it);
+            } else {
+                ::close(cfd);
+            }
+            // deregister filters
+            reg_ev(cfd, EVFILT_READ, EV_DELETE);
+            reg_ev(cfd, EVFILT_WRITE, EV_DELETE);
+        };
+
         std::cout << "Ready. Connect with: nc -U " << cfg.socket_path << "\n";
-        server.serve(g_shutdown, handler);
+
+        // main event loop
+        while (!g_shutdown.load(std::memory_order_relaxed)) {
+            struct kevent events[64];
+            timespec ts{0, 200 * 1000 * 1000}; // 200ms tick
+            int nev = ::kevent(kq, nullptr, 0, events, 64, &ts);
+            if (nev < 0) {
+                if (errno == EINTR) continue;
+                std::perror("kevent(wait)");
+                break;
+            }
+
+            for (int i = 0; i < nev; ++i) {
+                auto &ev = events[i];
+                int fd = static_cast<int>(ev.ident);
+                if (fd == server.fd() && ev.filter == EVFILT_READ) {
+                    // accept new client
+                    sockaddr_un su; socklen_t sl = sizeof(su);
+                    int cfd = ::accept(server.fd(), (sockaddr*)&su, &sl);
+                    if (cfd >= 0) {
+                        // non-blocking + no-sigpipe
+                        int fl = ::fcntl(cfd, F_GETFL, 0);
+                        if (fl != -1) ::fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+#ifdef SO_NOSIGPIPE
+                        int one = 1; ::setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+                        if (sessions.size() >= cfg.max_sessions) {
+                            ::close(cfd);
+                            continue;
+                        }
+                        auto sess = std::make_unique<uma::ipc::ClientSession>();
+                        sess->fd = cfd;
+                        sess->ctx = model.new_context().release();
+                        sess->last_activity_ns = now_ns();
+                        sessions[cfd] = std::move(sess);
+                        reg_ev(cfd, EVFILT_READ, EV_ADD);
+                    }
+                } else if (ev.filter == EVFILT_READ) {
+                    // client read
+                    auto it = sessions.find(fd);
+                    if (it == sessions.end()) continue;
+                    auto & s = *it->second;
+                    uint8_t buf[4096];
+                    ssize_t n = ::read(fd, buf, sizeof(buf));
+                    if (n <= 0) {
+                        close_session(fd);
+                        continue;
+                    }
+                    s.rx.insert(s.rx.end(), buf, buf + n);
+                    s.last_activity_ns = now_ns();
+                    if (s.rx.size() > cfg.max_prompt_bytes) {
+                        s.last_error = "prompt too large";
+                        s.state = uma::ipc::SessionState::ERRORED;
+                    }
+                    // Check for newline-terminated prompt
+                    auto nl = std::find(s.rx.begin(), s.rx.end(), (uint8_t) '\n');
+                    if (nl != s.rx.end()) {
+                        std::string prompt(s.rx.begin(), nl);
+                        s.rx.erase(s.rx.begin(), nl + 1);
+                        // run generation synchronously (sequential compute OK in M2)
+                        try {
+                            (void)uma::runtime::generate_greedy_stream(
+                                s.ctx, model.get(), prompt, (int)cfg.max_tokens,
+                                [&](const char* data, size_t len){
+                                    s.tx.insert(s.tx.end(), (const uint8_t*)data, (const uint8_t*)data + len);
+                                }
+                            );
+                            s.state = uma::ipc::SessionState::STREAM;
+                            // enable write notifications
+                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                        } catch (...) {
+                            s.last_error = "generation error";
+                            s.state = uma::ipc::SessionState::ERRORED;
+                        }
+                    }
+                } else if (ev.filter == EVFILT_WRITE) {
+                    // client write
+                    auto it = sessions.find(fd);
+                    if (it == sessions.end()) continue;
+                    auto & s = *it->second;
+                    while (!s.tx.empty()) {
+                        ssize_t w = ::write(fd, s.tx.data(), s.tx.size());
+                        if (w < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                            close_session(fd);
+                            goto next_event;
+                        }
+                        s.tx.erase(s.tx.begin(), s.tx.begin() + w);
+                        s.last_activity_ns = now_ns();
+                    }
+                    if (s.tx.empty()) {
+                        // done streaming, stop write notifications
+                        reg_ev(fd, EVFILT_WRITE, EV_DELETE);
+                        // keep connection open for now to allow multiple prompts per session
+                    }
+                }
+            next_event: ;
+            }
+
+            // idle timeout cleanup
+            uint64_t now = now_ns();
+            uint64_t idle_ns = (uint64_t) cfg.idle_timeout_sec * 1000ull * 1000ull * 1000ull;
+            std::vector<int> to_close;
+            for (auto & kv : sessions) {
+                auto & s = *kv.second;
+                if (idle_ns > 0 && now - s.last_activity_ns > idle_ns) {
+                    to_close.push_back(s.fd);
+                }
+            }
+            for (int fd_c : to_close) close_session(fd_c);
+        }
 
         std::cout << "Shutdown requested. Draining & cleaning up…\n";
         // Contexts would be drained here when implemented.

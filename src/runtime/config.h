@@ -18,6 +18,12 @@ struct RuntimeConfig {
     std::string socket_path = "/tmp/uma.sock"; // UDS path
     uint16_t socket_mode = 0600;                // file mode for socket
 
+    // Limits (M2)
+    uint32_t max_sessions = 16;
+    uint32_t max_prompt_bytes = 8192; // per request
+    uint32_t max_tokens = 512;        // per request
+    uint32_t idle_timeout_sec = 300;  // close idle sessions
+
     // llama.cpp model params
     bool use_mmap  = true;
     bool use_mlock = false;

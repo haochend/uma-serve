@@ -67,6 +67,14 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
             cfg.swa_full = true;
         } else if (arg == "--sock" || arg == "--socket") {
             cfg.socket_path = need("--socket");
+        } else if (arg == "--max-sessions") {
+            cfg.max_sessions = static_cast<uint32_t>(std::strtoul(need("--max-sessions"), nullptr, 10));
+        } else if (arg == "--max-prompt-bytes") {
+            cfg.max_prompt_bytes = static_cast<uint32_t>(std::strtoul(need("--max-prompt-bytes"), nullptr, 10));
+        } else if (arg == "--max-tokens") {
+            cfg.max_tokens = static_cast<uint32_t>(std::strtoul(need("--max-tokens"), nullptr, 10));
+        } else if (arg == "--idle-timeout-sec") {
+            cfg.idle_timeout_sec = static_cast<uint32_t>(std::strtoul(need("--idle-timeout-sec"), nullptr, 10));
         } else if (arg == "--help" || arg == "-h") {
             throw std::invalid_argument("help");
         }

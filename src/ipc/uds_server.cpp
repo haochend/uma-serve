@@ -101,5 +101,22 @@ bool UDSServer::serve(std::atomic<bool>& shutdown_flag, const Handler& handler) 
     return true;
 }
 
-} // namespace uma::ipc
+bool UDSServer::open_listen() {
+    if (!open_socket_()) return false;
+    // set non-blocking and no-sigpipe on listen fd
+    int flags = ::fcntl(listen_fd_, F_GETFL, 0);
+    if (flags != -1) {
+        ::fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK);
+    }
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    ::setsockopt(listen_fd_, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+    return true;
+}
 
+void UDSServer::close_listen() {
+    close_socket_();
+}
+
+} // namespace uma::ipc

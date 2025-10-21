@@ -85,31 +85,31 @@ uma-serve/
 
 **I/O model**
 
-* [ ] Switch to **`kqueue`** (macOS) with fallbacks: `poll` (Linux).
-* [ ] Register: listen FD (read), per-client FDs (read/write, HUP/ERR).
-* [ ] Non-blocking sockets (`O_NONBLOCK`), backpressure via per-session TX ring.
+* [x] Switch to **`kqueue`** (macOS) with fallbacks: `poll` (Linux).
+* [x] Register: listen FD (read), per-client FDs (read/write, HUP/ERR).
+* [x] Non-blocking sockets (`O_NONBLOCK`), backpressure via per-session TX ring.
 
 **Session state**
 
-* [ ] `struct ClientSession {`
+* [x] `struct ClientSession {`
 
-  * [ ] `int fd;`
-  * [ ] `std::vector<uint8_t> rx, tx;`
-  * [ ] `llama_context* ctx;`
-  * [ ] `llama_seq_id seq;`
-  * [ ] `StateMachine state; // RECV_REQ → PREFILL → DECODE → STREAM → DONE`
-  * [ ] `std::vector<llama_token> prompt, generated;`
-  * [ ] `uint64_t last_activity_ns;`
-  * [ ] `bool wants_stream;`
-  * [ ] `Error last_error;`
-  * [ ] `};`
-* [ ] `SessionPool` (`std::unordered_map<int, ClientSession>`).
-* [ ] Cleanup: on HUP/ERR remove from poller, free `ctx`, close fd.
+  * [x] `int fd;`
+  * [x] `std::vector<uint8_t> rx, tx;`
+  * [x] `llama_context* ctx;`
+  * [x] `llama_seq_id seq;`
+  * [x] `StateMachine state; // RECV_REQ → PREFILL → DECODE → STREAM → DONE`
+  * [x] `std::vector<llama_token> prompt, generated;`
+  * [x] `uint64_t last_activity_ns;`
+  * [x] `bool wants_stream;`
+  * [x] `Error last_error;`
+  * [x] `};`
+* [x] `SessionPool` (`std::unordered_map<int, ClientSession>`).
+* [x] Cleanup: on HUP/ERR remove from poller, free `ctx`, close fd.
 
 **Safety & limits**
 
-* [ ] Configurable caps: max sessions, max prompt bytes, max tokens.
-* [ ] Idle timeout (e.g., 5 min).
+* [x] Configurable caps: max sessions, max prompt bytes, max tokens.
+* [x] Idle timeout (e.g., 5 min).
 * [ ] Input parser guards (UTF-8, reasonable JSON size later).
 
 **Acceptance (M2)**

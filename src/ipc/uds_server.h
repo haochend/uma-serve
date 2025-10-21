@@ -17,6 +17,11 @@ public:
     // Blocking accept loop; exits when shutdown flag is set
     bool serve(std::atomic<bool>& shutdown_flag, const Handler& handler);
 
+    // Open the listening socket (non-blocking) but do not accept
+    bool open_listen();
+    int  fd() const { return listen_fd_; }
+    void close_listen();
+
 private:
     std::string path_;
     unsigned mode_;
@@ -27,4 +32,3 @@ private:
 };
 
 } // namespace uma::ipc
-
