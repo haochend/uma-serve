@@ -14,6 +14,10 @@ struct RuntimeConfig {
     uint32_t n_ctx = 4096;      // tokens of context window
     int32_t  n_threads = 0;     // 0 = use ggml default
 
+    // IPC (UDS)
+    std::string socket_path = "/tmp/uma.sock"; // UDS path
+    uint16_t socket_mode = 0600;                // file mode for socket
+
     // llama.cpp model params
     bool use_mmap  = true;
     bool use_mlock = false;
@@ -28,4 +32,3 @@ struct RuntimeConfig {
 };
 
 } // namespace uma::runtime
-

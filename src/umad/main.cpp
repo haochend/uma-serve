@@ -2,6 +2,8 @@
 
 #include "runtime/config.h"
 #include "runtime/model.h"
+#include "runtime/infer.h"
+#include "ipc/uds_server.h"
 
 #include "llama.h"
 
@@ -11,6 +13,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <unistd.h>
 
 using uma::runtime::RuntimeConfig;
 using uma::runtime::LlamaBackendGuard;
@@ -25,14 +28,19 @@ namespace {
     }
 
     void install_signal_handlers() {
-        std::signal(SIGINT,  signal_handler);
-        std::signal(SIGTERM, signal_handler);
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0; // do not set SA_RESTART so accept() is interrupted
+        sigaction(SIGINT,  &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
     }
 
     void print_usage() {
         std::cout << "umad - UMA Serve runtime daemon (M1 foundations)\n"
-                  << "Usage: umad --model /path/model.gguf [--n-ctx 4096] [--threads N] [--mlock] [--{no-}mmap]\n\n"
-                  << "Env: UMA_MODEL, UMA_N_CTX, UMA_THREADS, UMA_USE_MMAP, UMA_USE_MLOCK\n";
+                  << "Usage: umad --model /path/model.gguf [--n-ctx 4096] [--threads N] [--mlock] [--{no-}mmap] [--socket /tmp/uma.sock]\n\n"
+                  << "Env: UMA_MODEL, UMA_N_CTX, UMA_THREADS, UMA_USE_MMAP, UMA_USE_MLOCK, UMA_SOCK\n";
     }
 }
 
@@ -86,11 +94,57 @@ int main(int argc, char** argv) {
                   << " n_threads=" << cfg.n_threads
                   << "\n";
 
-        // For M1 section, just keep the daemon alive until signal.
-        // Later sections will add UDS server & I/O loops.
-        while (!g_shutdown.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        }
+        // UDS server (single-client blocking, newline-terminated prompt)
+        uma::ipc::UDSServer server(cfg.socket_path, cfg.socket_mode);
+
+        auto handler = [&](int cfd) {
+            // Read until newline
+            std::string prompt;
+            char buf[1024];
+            while (true) {
+                ssize_t n = ::read(cfd, buf, sizeof(buf));
+                if (n <= 0) break;
+                prompt.append(buf, buf + n);
+                auto pos = prompt.find('\n');
+                if (pos != std::string::npos) {
+                    prompt.resize(pos); // strip newline
+                    break;
+                }
+                // keep reading until newline or EOF
+            }
+
+            if (prompt.empty()) {
+                return; // nothing to do
+            }
+
+            auto write_all = [&](const char* p, size_t nbytes) {
+                const char* pcur = p;
+                size_t left = nbytes;
+                while (left > 0) {
+                    ssize_t w = ::write(cfd, pcur, left);
+                    if (w <= 0) return false;
+                    left -= static_cast<size_t>(w);
+                    pcur += w;
+                }
+                return true;
+            };
+
+            // Generate and stream pieces as raw bytes
+            try {
+                (void)uma::runtime::generate_greedy_stream(
+                    admin_ctx.get(), model.get(), prompt, /*max_new_tokens*/256,
+                    [&](const char* data, size_t len){
+                        (void) write_all(data, len);
+                    }
+                );
+            } catch (const std::exception& e) {
+                std::string msg = std::string("error: ") + e.what() + "\n";
+                (void) write_all(msg.c_str(), msg.size());
+            }
+        };
+
+        std::cout << "Ready. Connect with: nc -U " << cfg.socket_path << "\n";
+        server.serve(g_shutdown, handler);
 
         std::cout << "Shutdown requested. Draining & cleaning up…\n";
         // Contexts would be drained here when implemented.

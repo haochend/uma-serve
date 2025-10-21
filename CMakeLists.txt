@@ -19,6 +19,8 @@ add_executable(umad
     src/umad/main.cpp
     src/runtime/config.cpp
     src/runtime/model.cpp
+    src/runtime/infer.cpp
+    src/ipc/uds_server.cpp
 )
 
 # --- 5. Link Your Server to the Engine ---

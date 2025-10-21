@@ -58,26 +58,26 @@ uma-serve/
 
 **UDS server (macOS first)**
 
-* [ ] Path `/tmp/uma.sock` (configurable).
-* [ ] `socket(AF_UNIX)`, `bind`, `listen`, `accept`.
-* [ ] `umask` + `chmod` secure (0600 default).
-* [ ] Remove stale socket on boot.
+* [x] Path `/tmp/uma.sock` (configurable).
+* [x] `socket(AF_UNIX)`, `bind`, `listen`, `accept`.
+* [x] `umask` + `chmod` secure (0600 default).
+* [x] Remove stale socket on boot.
 
 **Wire a single request**
 
-* [ ] Blocking loop: read prompt (newline-terminated for W1).
-* [ ] Minimal inference: `tokenize → batch(-1) → decode()/sample → stream`.
-* [ ] Stream tokens as raw bytes (W1 only), flush on every piece.
+* [x] Blocking loop: read prompt (newline-terminated for W1).
+* [x] Minimal inference: `tokenize → batch(-1) → decode()/sample → stream`.
+* [x] Stream tokens as raw bytes (W1 only), flush on every piece.
 
 **Build & run**
 
 * [x] CMake target `umad`; RelWithDebInfo; LTO off initially.
-* [ ] `scripts/run_dev.sh` (sets `LLAMA_*` env if needed).
+* [x] `scripts/run_dev.sh` (sets `LLAMA_*` env if needed).
 
 **Acceptance (M1)**
 
-* [ ] `nc -U /tmp/uma.sock` → send a prompt → streamed reply.
-* [ ] Model loads exactly once; RSS stable across 3 prompts.
+* [x] `nc -U /tmp/uma.sock` → send a prompt → streamed reply.
+* [x] Model loads exactly once; RSS stable across 3 prompts.
 
 ---
 

@@ -27,6 +27,7 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
     if (auto* m = get_env("UMA_MODEL"))   cfg.model_path = m;
     if (auto* s = get_env("UMA_N_CTX"))   cfg.n_ctx     = static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
     if (auto* t = get_env("UMA_THREADS")) cfg.n_threads = static_cast<int32_t>(std::strtol(t, nullptr, 10));
+    if (auto* sp = get_env("UMA_SOCK"))   cfg.socket_path = sp;
     if (auto* v = get_env("UMA_USE_MMAP"))  cfg.use_mmap  = parse_bool_flag(v);
     if (auto* v = get_env("UMA_USE_MLOCK")) cfg.use_mlock = parse_bool_flag(v);
 
@@ -64,6 +65,8 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
             cfg.swa_full = false;
         } else if (arg == "--swa-full") {
             cfg.swa_full = true;
+        } else if (arg == "--sock" || arg == "--socket") {
+            cfg.socket_path = need("--socket");
         } else if (arg == "--help" || arg == "-h") {
             throw std::invalid_argument("help");
         }
@@ -73,4 +76,3 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
 }
 
 } // namespace uma::runtime
-
