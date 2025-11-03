@@ -75,6 +75,8 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
             cfg.max_tokens = static_cast<uint32_t>(std::strtoul(need("--max-tokens"), nullptr, 10));
         } else if (arg == "--idle-timeout-sec") {
             cfg.idle_timeout_sec = static_cast<uint32_t>(std::strtoul(need("--idle-timeout-sec"), nullptr, 10));
+        } else if (arg == "--max-merge") {
+            cfg.max_merge = static_cast<uint32_t>(std::strtoul(need("--max-merge"), nullptr, 10));
         } else if (arg == "--help" || arg == "-h") {
             throw std::invalid_argument("help");
         }

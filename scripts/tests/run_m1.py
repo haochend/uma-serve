@@ -13,12 +13,20 @@ import time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
-def start_daemon(model, sock_path, n_ctx=None, threads=None):
+def start_daemon(model, sock_path, n_ctx=None, threads=None, max_tokens=32):
     bin_path = os.path.join(ROOT, "build", "umad")
     if not os.path.exists(bin_path):
         # build if missing
         subprocess.run([os.path.join(ROOT, "build.sh")], check=True)
-    cmd = [bin_path, "--model", model, "--socket", sock_path]
+    cmd = [
+        bin_path,
+        "--model",
+        model,
+        "--socket",
+        sock_path,
+        "--max-tokens",
+        str(max_tokens),
+    ]
     if n_ctx:
         cmd += ["--n-ctx", str(n_ctx)]
     if threads:
@@ -120,12 +128,16 @@ def test_reuse_session(sock_path):
                 if b"\n" in data:
                     break
             out = b"".join(chunks)
-            assert len(out) > 0 and out.endswith(b"\n"), "session reuse response invalid"
+            assert len(out) > 0 and out.endswith(b"\n"), (
+                "session reuse response invalid"
+            )
 
 
 def get_rss_kib(pid: int) -> int:
     try:
-        out = subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)], text=True).strip()
+        out = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(pid)], text=True
+        ).strip()
         return int(out)
     except Exception:
         return -1
@@ -173,11 +185,15 @@ def main():
         print("--model or UMA_MODEL is required", file=sys.stderr)
         return 2
 
-    sock_path = args.socket or os.path.join(tempfile.gettempdir(), f"uma.test.{os.getpid()}.sock")
+    sock_path = args.socket or os.path.join(
+        tempfile.gettempdir(), f"uma.test.{os.getpid()}.sock"
+    )
 
     proc = None
     try:
-        proc = start_daemon(args.model, sock_path, n_ctx=args.n_ctx, threads=args.threads)
+        proc = start_daemon(
+            args.model, sock_path, n_ctx=args.n_ctx, threads=args.threads
+        )
         test_basic(sock_path)
         test_multi_clients(sock_path)
         test_reuse_session(sock_path)
@@ -213,8 +229,10 @@ def test_oversize(sock_path):
 
 
 def test_invalid_utf8(sock_path):
-    bad = b"\xC0bad\n"
+    bad = b"\xc0bad\n"
     out = uds_request(sock_path, "", raw_bytes=bad, timeout=30)
     assert b"error: invalid utf-8" in out, "expected utf-8 error"
+
+
 if __name__ == "__main__":
     sys.exit(main())

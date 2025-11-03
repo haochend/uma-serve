@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 3.13)
 project(uma_serve LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 
+# Enable the compile‑commands export
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # --- 2. Configure llama.cpp (The "Engine") ---
 # Set llama.cpp's build options BEFORE adding it.
 set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
@@ -19,7 +22,6 @@ add_executable(umad
     src/umad/main.cpp
     src/runtime/config.cpp
     src/runtime/model.cpp
-    src/runtime/infer.cpp
     src/ipc/uds_server.cpp
 )
 

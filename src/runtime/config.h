@@ -21,8 +21,11 @@ struct RuntimeConfig {
     // Limits (M2)
     uint32_t max_sessions = 16;
     uint32_t max_prompt_bytes = 8192; // per request
-    uint32_t max_tokens = 512;        // per request
+    uint32_t max_tokens = 64;         // per request (default small for responsiveness)
     uint32_t idle_timeout_sec = 300;  // close idle sessions
+
+    // Scheduling (M3)
+    uint32_t max_merge = 4;           // max sessions to merge per tick
 
     // llama.cpp model params
     bool use_mmap  = true;

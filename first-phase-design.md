@@ -121,23 +121,27 @@ uma-serve/
 
 ### Week 3 — Concurrent Batching v0 (M3)
 
-**Scheduler loop (single thread to start)**
+Implemented in daemon (single-thread scheduler) with chunked batching and correct logits mapping.
 
-* [ ] `ReadyQueue` = sessions in `PREFILL|DECODE` with tokens pending.
-* [ ] Build **global `llama_batch`** per tick:
+**Scheduler loop**
 
-  * [ ] For each ready session, append next token(s).
-  * [ ] Annotate with `llama_seq_id = session.seq`.
-  * [ ] Keep **max_merge** (config; start 2–4).
-* [ ] `llama_decode(model, batch)` **once** per tick.
-* [ ] Per session: pluck logits view, sample next token (greedy at first).
-* [ ] Push streamed piece into `tx`; advance state.
+* [x] `ReadyQueue` = sessions in `PREFILL|DECODE` with tokens pending.
+* [x] Build a single **global `llama_batch`** per tick:
+
+  * [x] Two-phase policy per tick with an adaptive token budget:
+    - Phase A (DECODE): give exactly 1 token to each decoding session (round-robin), ensuring interactive streams progress.
+    - Phase B (PREFILL): use the remaining budget to drain prompts in large chunks per session (round-robin across sessions). Mark `logits=true` only on the last token of each per-session chunk.
+  * [x] Annotate each item with `llama_seq_id = session.seq`.
+  * [x] Budget = `min(target_batch, llama_n_batch(ctx))`. `target_batch` starts conservative and adapts toward a ~30 ms decode budget using an EWMA of recent decode times.
+* [x] `llama_decode(ctx, batch)` **once** per tick.
+* [x] Sampling: read logits only for entries where `logits==1`, using the exact batch index captured during build (fixes invalid `get_logits_ith()` mapping). Greedy sampling for now.
+* [x] Stream pieces into per-session `tx`; arm `EVFILT_WRITE`; transition session state.
 
 **Latency guard (lightweight)**
 
-* [ ] Record per-session per-token latency EWMA.
-* [ ] If predicted p95 would exceed **`latency_cap`** (default 1.20× of solo), **skip merging** that adds more than `max_merge` or temporarily deprioritize background sessions.
-* [ ] Simple heuristic: cap batch size if `now - session.last_emit > cap_ms`.
+* [x] Adaptive `target_batch` tuned by decode-time EWMA toward a ~30 ms tick budget.
+* [x] Interactivity guard: if any DECODE session has not emitted for ~150 ms, skip PREFILL for that tick (DECODE-only tick).
+* [ ] Per-session per-token latency EWMA (not yet tracked).
 
 **Metrics (stub)**
 
@@ -238,9 +242,35 @@ ERROR → teardown (send error event if possible)
 
 ### 4) Scheduler v0 (merge policy)
 
-* **Token-merge window:** up to `max_merge` tokens when multiple sessions are ready, otherwise 1.
-* **Fairness:** round-robin over ready sessions; deprioritize sessions with age < `min_inter_token_ms`.
-* **Guard:** if `(now - last_emit_ms) > cap_ms` for an interactive session, include it solo next tick.
+Implemented policy (replaces per-token round-robin):
+
+- Token budget per tick: `budget = min(target_batch, llama_n_batch(ctx))`.
+- Phase A — DECODE first: append exactly 1 token per decoding session (round-robin), each with `logits=true`.
+- Phase B — PREFILL chunking: drain remaining budget across prefill sessions in large chunks (round-robin). Set `logits=true` only on the last token of each per-session chunk.
+- Correct logits mapping: store the batch index for every `logits=true` entry and pass that index to `llama_get_logits_ith()` after decode.
+- Fairness: separate RR cursors for DECODE and PREFILL phases to avoid starvation.
+- Latency guard: if any DECODE session’s time since last emit exceeds ~150 ms, skip PREFILL for the tick.
+- Adaptation: maintain a decode-time EWMA and nudge `target_batch` toward a ~30 ms decode budget.
+
+Notes:
+
+- This eliminates per-token round-robin (which was too granular and slow), greatly reducing decode-call overhead and improving TTFT/throughput.
+- `max_merge` is superseded by the capacity-aware `budget` and adaptive `target_batch`.
+
+Open items:
+
+- Per-session latency EWMA and more nuanced interactive vs. background prioritization remain TODO.
+
+---
+
+## Implementation Updates (landed)
+
+- Removed Week 1 minimal inference helpers (`runtime/infer.*`); the daemon always uses the global scheduler path.
+- UDS server runs non-blocking; kqueue loop manages accept/read/write; sockets are closed cleanly with EV_DELETE guards.
+- Input parser guards: newline framing (W1), CR trim, NUL reject, UTF‑8 validator, prompt size cap.
+- Prompt echo: after tokenizing a prompt, the daemon immediately streams the original prompt pieces to provide early bytes on large models (helps tests avoid client timeouts).
+- Session teardown: on error/EOS/idle timeout, remove kqueue filters, close fd, and clear per-seq KV memory.
+- Logging: verbose traces (`[accept] [prompt] [batch] [sample] [write-now]`) are emitted only when `UMA_DEBUG=1`. Default logs are concise (startup, model/context info, UDS path, readiness, shutdown).
 
 ### 5) Error Handling & Codes
 
