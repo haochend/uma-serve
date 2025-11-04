@@ -3,6 +3,7 @@
 #include "runtime/config.h"
 #include "runtime/model.h"
 #include "ipc/uds_server.h"
+#include "metrics/metrics.h"
 #include "ipc/session.h"
 
 #include "llama.h"
@@ -191,6 +192,10 @@ int main(int argc, char** argv) {
         const double tick_budget_ms = 30.0; // soft budget per decode
         double decode_ms_ewma = tick_budget_ms; // seed EWMA
 
+        // Metrics (M4 stub)
+        uma::metrics::Metrics mtx;
+        mtx.set_decode_ms_ewma(decode_ms_ewma);
+
         auto now_ns = [](){
             using namespace std::chrono;
             return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
@@ -220,7 +225,18 @@ int main(int argc, char** argv) {
         // main event loop
         while (!g_shutdown.load(std::memory_order_relaxed)) {
             struct kevent events[64];
-            timespec ts{0, 200 * 1000 * 1000}; // 200ms tick
+            // Dynamic timeout: if any session has ready work, don't sleep; otherwise idle for 200ms
+            bool has_ready_work = false;
+            for (auto & kv : sessions) {
+                auto & s = *kv.second;
+                if ((s.state == uma::ipc::SessionState::PREFILL && s.prefill_idx < s.prompt_tokens.size()) ||
+                    (s.state == uma::ipc::SessionState::DECODE && s.has_pending_tok)) {
+                    has_ready_work = true; break;
+                }
+            }
+            timespec ts;
+            if (has_ready_work) { ts = timespec{0, 0}; }
+            else                { ts = timespec{0, 200 * 1000 * 1000}; }
             int nev = ::kevent(kq, nullptr, 0, events, 64, &ts);
             if (nev < 0) {
                 if (errno == EINTR) continue;
@@ -295,6 +311,18 @@ int main(int argc, char** argv) {
                         if (s.state != uma::ipc::SessionState::RECV_REQ) {
                             const std::string emsg = "error: busy\n";
                             s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
+                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                            continue;
+                        }
+                        // Admin: metrics endpoint via UDS prompt
+                        if (prompt == "/metrics" || prompt == "metrics") {
+                            std::string js = mtx.to_json((uint32_t) sessions.size());
+                            s.tx.insert(s.tx.end(), js.begin(), js.end());
+                            s.tx.push_back('\n');
+                            // One-shot admin response: close after flushing
+                            s.state = uma::ipc::SessionState::STREAM;
+                            s.read_closed = true; // trigger close after tx drains
+                            reg_ev(fd, EVFILT_READ, EV_DELETE);
                             reg_ev(fd, EVFILT_WRITE, EV_ADD);
                             continue;
                         }
@@ -521,8 +549,13 @@ int main(int argc, char** argv) {
                 int dec_rc = llama_decode(gctx, batch);
                 auto t1 = std::chrono::steady_clock::now();
                 double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+                // update metrics
+                mtx.batch_calls_total.fetch_add(1, std::memory_order_relaxed);
+                mtx.last_batch_size.store((uint32_t) tokens.size(), std::memory_order_relaxed);
+                mtx.decode_ms_last.store((uint32_t) (ms + 0.5), std::memory_order_relaxed);
                 // EWMA toward observed decode time
                 decode_ms_ewma = 0.8 * decode_ms_ewma + 0.2 * ms;
+                mtx.set_decode_ms_ewma(decode_ms_ewma);
                 // Simple adaptive tuning
                 if (decode_ms_ewma > 1.3 * tick_budget_ms) {
                     target_batch = std::max<int32_t>(8, (int32_t) (target_batch * 0.7));
@@ -570,6 +603,7 @@ int main(int argc, char** argv) {
                             char buf[256];
                             int n = llama_token_to_piece(vocab, new_id, buf, sizeof(buf), 0, true);
                             if (n > 0) s.tx.insert(s.tx.end(), (uint8_t*)buf, (uint8_t*)buf + n);
+                            mtx.tokens_generated_total.fetch_add(1, std::memory_order_relaxed);
                         } else {
                             // stream piece or finish
                             if (llama_vocab_is_eog(vocab, new_id) || s.generated_count >= cfg.max_tokens) {
@@ -585,6 +619,7 @@ int main(int argc, char** argv) {
                                 s.pending_tok = new_id;
                                 s.has_pending_tok = true;
                                 s.state = uma::ipc::SessionState::DECODE;
+                                mtx.tokens_generated_total.fetch_add(1, std::memory_order_relaxed);
                             }
                         }
                         // try immediate drain and/or arm write readiness

@@ -77,7 +77,7 @@ uma-serve/
 **Acceptance (M1)**
 
 * [x] `nc -U /tmp/uma.sock` → send a prompt → streamed reply.
-* [x] Model loads exactly once; RSS stable across 3 prompts.
+* [x] Model loads exactly once; RSS stable across 3 prompts (`scripts/tests/run_m1.py`).
 
 ---
 
@@ -114,8 +114,8 @@ uma-serve/
 
 **Acceptance (M2)**
 
-* [x] 4 terminals connect simultaneously; sequential compute is okay.
-* [x] No crashes/leaks (`leaks`, `Activity Monitor` RSS flat except contexts).
+* [x] 4 clients connect concurrently; all receive output (`scripts/tests/run_m1.py`).
+* [x] No crashes/leaks observed in smoke runs (RSS flat except contexts).
 
 ---
 
@@ -151,8 +151,8 @@ Implemented in daemon (single-thread scheduler) with chunked batching and correc
 
 **Acceptance (M3)**
 
-* [ ] Run long job + short Q/A → visible interleaving at terminal(s).
-* [ ] Average batch size ≥ 1.5 while short job maintains snappy tokens.
+* [x] Long + short prompts interleave; short receives output before long completes (`scripts/tests/run_m3.py`).
+* [ ] Average batch size ≥ 1.5 while short job maintains snappy tokens (needs metrics).
 
 ---
 
@@ -217,6 +217,19 @@ Implemented in daemon (single-thread scheduler) with chunked batching and correc
 * **Optional sampler thread:** can be added in Phase 2 to overlap CPU sampling; P1 uses main thread for simplicity.
 * **No locks** on hot path in P1 (single producer/consumer semantics inside the scheduler tick).
 
+### I/O Loop & Wakeups
+
+Current (Phase 1):
+- `kqueue/kevent` multiplexes accept/read/write and HUP/ERR for all sockets.
+- Dynamic timeout: if any session has ready work (PREFILL remaining or DECODE pending), `kevent` uses a zero timeout to return immediately and run a decode tick; otherwise it idles for ~200 ms.
+
+Next (Phase 1 closeout → Phase 2):
+- Add a user-space wakeup source so the loop can block and still be woken by compute work:
+  - macOS: `EVFILT_USER` with `NOTE_TRIGGER`.
+  - Linux: `eventfd` integrated via `epoll`.
+- This removes the zero-timeout polling path while keeping instant wake-ups for both I/O and compute.
+- Later, split into I/O thread (blocks in kevent/epoll) and compute thread(s) woken by a condition variable.
+
 ### 2) State Machine (per session)
 
 ```
@@ -271,6 +284,25 @@ Open items:
 - Prompt echo: after tokenizing a prompt, the daemon immediately streams the original prompt pieces to provide early bytes on large models (helps tests avoid client timeouts).
 - Session teardown: on error/EOS/idle timeout, remove kqueue filters, close fd, and clear per-seq KV memory.
 - Logging: verbose traces (`[accept] [prompt] [batch] [sample] [write-now]`) are emitted only when `UMA_DEBUG=1`. Default logs are concise (startup, model/context info, UDS path, readiness, shutdown).
+- Event loop: dynamic timeout (no sleep when work exists; idle sleep when not) to avoid stalling compute work on single/few-session loads.
+
+---
+
+## How to Run
+
+- Quick start (M1/M2 smoke):
+  - `UMA_MODEL=/path/to/model.gguf python3 scripts/tests/run_m1.py`
+  - Set `UMA_DEBUG=1` to see detailed scheduler and I/O traces in `build/umad_test.log`.
+- Interleaving smoke (M3):
+  - `UMA_MODEL=/path/to/model.gguf python3 scripts/tests/run_m3.py`
+  - Confirms short prompt receives output before long job completes.
+
+Known limitations (Phase 1):
+- Newline-based protocol only; framed JSON not implemented yet.
+- Single-threaded scheduler (decode + sampling on main thread).
+- Fixed kqueue wait (200 ms) when idle; no-sleep fast path when work exists is a next step.
+- Metrics endpoint not implemented; batch size and latency are not recorded yet.
+- macOS kqueue path only; Linux epoll path to add.
 
 ### 5) Error Handling & Codes
 
@@ -307,8 +339,9 @@ limits:
   max_prompt_bytes: 65536
   max_tokens: 2048
 scheduler:
-  max_merge: 2
-  latency_cap: 1.20
+  # batch budget adapts automatically toward ~30 ms; optional hints:
+  tick_budget_ms: 30
+  start_target_tokens: 32
 metrics:
   tick_interval_ms: 1000
 ```
@@ -341,6 +374,18 @@ metrics:
 * **Prompts:** ASCII, UTF-8 w/ emojis, 32k ctx boundary.
 
 ---
+
+## Roadmap (near-term)
+
+- EVFILT_USER (macOS) / eventfd (Linux) wakeups to replace zero-timeout polling; add `epoll` backend and a small poller abstraction.
+- Minimal metrics: `/metrics` JSON with `decode_ms_last`, `batch_size_last`, `decode_ms_ewma`, `active_sessions`.
+- Framed JSON protocol over UDS (request + streamed events) with partial I/O + backpressure.
+- Per-session latency EWMA and interactivity-aware batching (deadline-based preemption at token boundaries).
+
+## Positioning
+
+- UMA‑Serve: simplified, fairness‑oriented continuous batching on a single context; instructional baseline that now shows interleaving and adaptive batching.
+- llama.cpp server: production-grade continuous batching with a mature slot manager, HTTP/SSE, extensive features and optimizations. UMA‑Serve’s roadmap aims to add wakeups, metrics, framed protocol, and wedges like prefix caching and speculative decode to be production-ready with a performance edge for local/UDS deployments.
 
 ## Engineering Tasks by File/Module
 
@@ -375,9 +420,9 @@ metrics:
 
 ## Definition of Done (Phase 1)
 
-* [ ] `umad` runs; loads model once; survives connect/disconnect churn.
-* [ ] 4 concurrent sessions stream tokens; no memory growth > contexts.
-* [ ] Interleaved tokens across sessions with global `llama_decode`.
+* [x] `umad` runs; loads model once; survives connect/disconnect churn.
+* [x] 4 concurrent sessions stream tokens; no memory growth > contexts (smoke level).
+* [x] Interleaved tokens across sessions with global `llama_decode`.
 * [ ] Framed JSON protocol stable to partial reads/writes.
 * [ ] `uma-cli` usable; `/metrics` returns JSON without blocking.
 * [ ] Minimal docs: `README`, `PROTOCOL`, quickstart.
@@ -388,7 +433,7 @@ metrics:
 
 * **Event loop stalls due to big writes** → non-blocking + TX ring + `EVFILT_WRITE` readiness.
 * **Context memory blow-up** → document recommended `n_ctx`, warn + reject over-large prompts.
-* **Latency regressions** → keep `max_merge` small; implement simple guard; measure per-token latencies early.
+* **Latency regressions** → adaptive batch target with latency guard; measure per-token latencies early (metrics TODO).
 * **Sampler CPU spikes** → Phase 2: move to separate thread and read logits in-place (zero-copy path).
 
 ---

@@ -22,6 +22,7 @@ add_executable(umad
     src/umad/main.cpp
     src/runtime/config.cpp
     src/runtime/model.cpp
+    src/metrics/metrics.cpp
     src/ipc/uds_server.cpp
 )
 
