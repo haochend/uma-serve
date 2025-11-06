@@ -26,6 +26,12 @@ add_executable(umad
     src/ipc/uds_server.cpp
 )
 
+# Platform-specific sources
+if(APPLE)
+    # kqueue-based poller (macOS/BSD only)
+    target_sources(umad PRIVATE src/ipc/poller_kqueue.cpp)
+endif()
+
 # --- 5. Link Your Server to the Engine ---
 #
 #    *** THIS IS THE FIX ***

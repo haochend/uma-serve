@@ -1,0 +1,33 @@
+# clang-format configuration for this repository
+#
+# This is a balanced, broadly compatible starting point for C++.
+# Tweak to match your team preferences; I can adjust on request.
+
+BasedOnStyle: LLVM
+
+# Indentation and spacing
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 8
+AccessModifierOffset: -2
+IndentCaseLabels: true
+SpaceBeforeParens: ControlStatements
+Cpp11BracedListStyle: true
+
+# Line wrapping
+ColumnLimit: 100
+
+# Braces and short statements
+BreakBeforeBraces: Attach   # K&R style
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+
+# Pointers/references
+DerivePointerAlignment: false
+PointerAlignment: Left
+
+# Includes
+SortIncludes: true
+
