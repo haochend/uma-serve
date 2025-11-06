@@ -1,5 +1,6 @@
 // UMA Serve — Daemon + model lifecycle (M1 subset)
 
+#include "ipc/poller.h"
 #include "ipc/session.h"
 #include "ipc/uds_server.h"
 #include "metrics/metrics.h"
@@ -19,7 +20,6 @@
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <thread>
 #include <unistd.h>
 
 using uma::runtime::LlamaBackendGuard;
@@ -170,25 +170,8 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        int kq = ::kqueue();
-        if (kq < 0) {
-            std::perror("kqueue");
-            return 2;
-        }
-
-        auto reg_ev = [&](int fd, int16_t filter, uint16_t flags) {
-            struct kevent kev;
-            EV_SET(&kev, fd, filter, flags, 0, 0, nullptr);
-            if (::kevent(kq, &kev, 1, nullptr, 0, nullptr) < 0) {
-                if ((flags & EV_DELETE) && (errno == ENOENT || errno == EBADF)) {
-                    return; // benign: nothing to delete or fd already closed
-                }
-                std::perror("kevent(reg)");
-            }
-        };
-
-        // register listen fd for read
-        reg_ev(server.fd(), EVFILT_READ, EV_ADD);
+        uma::ipc::Poller poller;
+        poller.add(server.fd(), uma::ipc::PollFlags::Read);
 
         // session pool
         uma::ipc::SessionPool sessions;
@@ -216,8 +199,7 @@ int main(int argc, char** argv) {
 
         auto close_session = [&](int cfd) {
             // deregister filters
-            reg_ev(cfd, EVFILT_READ, EV_DELETE);
-            reg_ev(cfd, EVFILT_WRITE, EV_DELETE);
+            poller.remove(cfd, uma::ipc::PollFlags::Read | uma::ipc::PollFlags::Write);
 
             auto it = sessions.find(cfd);
             if (it != sessions.end()) {
@@ -250,13 +232,12 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
-            timespec ts;
-            if (has_ready_work) {
-                ts = timespec{0, 0};
-            } else {
-                ts = timespec{0, 200 * 1000 * 1000};
+            int time_ms = 0;
+            if (!has_ready_work) {
+                time_ms = 200 * 1000 * 1000;
             }
-            int nev = ::kevent(kq, nullptr, 0, events, 64, &ts);
+            std::vector<uma::ipc::PollEvent> ready_events;
+            int nev = poller.wait(time_ms, ready_events);
             if (nev < 0) {
                 if (errno == EINTR)
                     continue;
@@ -264,10 +245,8 @@ int main(int argc, char** argv) {
                 break;
             }
 
-            for (int i = 0; i < nev; ++i) {
-                auto& ev = events[i];
-                int fd = static_cast<int>(ev.ident);
-                if (fd == server.fd() && ev.filter == EVFILT_READ) {
+            for (auto& ev : ready_events) {
+                if (ev.fd == server.fd() && ev.readable()) {
                     // accept new client
                     sockaddr_un su;
                     socklen_t sl = sizeof(su);
@@ -290,21 +269,21 @@ int main(int argc, char** argv) {
                         sess->ctx = nullptr; // using global context for M3 batching
                         sess->last_activity_ns = now_ns();
                         sessions[cfd] = std::move(sess);
-                        reg_ev(cfd, EVFILT_READ, EV_ADD);
+                        poller.add(cfd, uma::ipc::PollFlags::Read);
                         if (g_debug)
                             std::cerr << "[accept] fd=" << cfd << " sessions=" << sessions.size()
                                       << "\n";
                     }
-                } else if (ev.filter == EVFILT_READ) {
+                } else if (ev.readable()) {
                     // client read
-                    auto it = sessions.find(fd);
+                    auto it = sessions.find(ev.fd);
                     if (it == sessions.end())
                         continue;
                     auto& s = *it->second;
                     uint8_t buf[4096];
                     bool saw_eof = false;
                     for (;;) {
-                        ssize_t n = ::read(fd, buf, sizeof(buf));
+                        ssize_t n = ::read(ev.fd, buf, sizeof(buf));
                         if (n > 0) {
                             if (s.rx.size() + (size_t)n > cfg.max_prompt_bytes) {
                                 const std::string msg = "error: prompt too large (limit " +
@@ -312,8 +291,8 @@ int main(int argc, char** argv) {
                                                         ")\n";
                                 s.tx.insert(s.tx.end(), msg.begin(), msg.end());
                                 s.state = uma::ipc::SessionState::ERRORED;
-                                reg_ev(fd, EVFILT_READ, EV_DELETE);
-                                reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                                poller.remove(ev.fd, uma::ipc::PollFlags::Read);
+                                poller.add(ev.fd, uma::ipc::PollFlags::Write);
                                 break;
                             }
                             s.rx.insert(s.rx.end(), buf, buf + n);
@@ -327,12 +306,12 @@ int main(int argc, char** argv) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK)
                             break;
                         // other error
-                        close_session(fd);
+                        close_session(ev.fd);
                         goto next_event;
                     }
                     if (saw_eof) {
                         s.read_closed = true;
-                        reg_ev(fd, EVFILT_READ, EV_DELETE);
+                        poller.remove(ev.fd, uma::ipc::PollFlags::Read);
                         s.last_activity_ns = now_ns();
                     }
                     // Check for newline-terminated prompt
@@ -343,7 +322,7 @@ int main(int argc, char** argv) {
                         if (s.state != uma::ipc::SessionState::RECV_REQ) {
                             const std::string emsg = "error: busy\n";
                             s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
-                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
                             continue;
                         }
                         // Admin: metrics endpoint via UDS prompt
@@ -354,8 +333,8 @@ int main(int argc, char** argv) {
                             // One-shot admin response: close after flushing
                             s.state = uma::ipc::SessionState::STREAM;
                             s.read_closed = true; // trigger close after tx drains
-                            reg_ev(fd, EVFILT_READ, EV_DELETE);
-                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                            poller.remove(ev.fd, uma::ipc::PollFlags::Read);
+                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
                             continue;
                         }
                         // trim trailing CR
@@ -366,8 +345,8 @@ int main(int argc, char** argv) {
                             const std::string emsg = "error: invalid input (NUL)\n";
                             s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
                             s.state = uma::ipc::SessionState::ERRORED;
-                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
-                            reg_ev(fd, EVFILT_READ, EV_DELETE);
+                            poller.remove(ev.fd, uma::ipc::PollFlags::Read);
+                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
                             continue;
                         }
                         // UTF-8 validation
@@ -375,8 +354,8 @@ int main(int argc, char** argv) {
                             const std::string emsg = "error: invalid utf-8\n";
                             s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
                             s.state = uma::ipc::SessionState::ERRORED;
-                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
-                            reg_ev(fd, EVFILT_READ, EV_DELETE);
+                            poller.remove(ev.fd, uma::ipc::PollFlags::Read);
+                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
                             continue;
                         }
                         // tokenize prompt and transition to PREFILL
@@ -391,8 +370,8 @@ int main(int argc, char** argv) {
                                 const std::string emsg = "error: tokenize failed\n";
                                 s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
                                 s.state = uma::ipc::SessionState::ERRORED;
-                                reg_ev(fd, EVFILT_WRITE, EV_ADD);
-                                reg_ev(fd, EVFILT_READ, EV_DELETE);
+                                poller.remove(ev.fd, uma::ipc::PollFlags::Read);
+                                poller.add(ev.fd, uma::ipc::PollFlags::Write);
                                 continue;
                             }
                             // For responsiveness (esp. on large models), echo the prompt pieces
@@ -408,15 +387,15 @@ int main(int argc, char** argv) {
                             if (!s.tx.empty()) {
                                 // Try an immediate non-blocking drain; then arm write notifications
                                 // if needed.
-                                ssize_t w = ::write(fd, s.tx.data(), s.tx.size());
+                                ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
                                 if (w > 0) {
                                     if (g_debug)
-                                        std::cerr << "[write-now] fd=" << fd
+                                        std::cerr << "[write-now] fd=" << ev.fd
                                                   << " wrote(prompt)=" << w << "\n";
                                     s.tx.erase(s.tx.begin(), s.tx.begin() + w);
                                 }
                                 if (!s.tx.empty())
-                                    reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                                    poller.add(ev.fd, uma::ipc::PollFlags::Write);
                             }
                             s.prefill_idx = 0;
                             s.generated_count = 0;
@@ -425,44 +404,44 @@ int main(int argc, char** argv) {
                                 s.seq = next_seq_id++;
                             s.state = uma::ipc::SessionState::PREFILL;
                             if (g_debug)
-                                std::cerr << "[prompt] fd=" << fd << " seq=" << s.seq
+                                std::cerr << "[prompt] fd=" << ev.fd << " seq=" << s.seq
                                           << " n_prompt=" << n_prompt << "\n";
                         } else {
                             // empty prompt -> immediate newline
                             s.tx.push_back('\n');
-                            reg_ev(fd, EVFILT_WRITE, EV_ADD);
+                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
                         }
                     }
-                } else if (ev.filter == EVFILT_WRITE) {
+                } else if (ev.writable()) {
                     // client write
-                    auto it = sessions.find(fd);
+                    auto it = sessions.find(ev.fd);
                     if (it == sessions.end())
                         continue;
                     auto& s = *it->second;
                     while (!s.tx.empty()) {
-                        ssize_t w = ::write(fd, s.tx.data(), s.tx.size());
+                        ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
                         if (w < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK)
                                 break;
-                            close_session(fd);
+                            close_session(ev.fd);
                             goto next_event;
                         }
                         if (g_debug)
-                            std::cerr << "[write] fd=" << fd << " wrote=" << w
+                            std::cerr << "[write] fd=" << ev.fd << " wrote=" << w
                                       << " tx_left=" << (s.tx.size() - (size_t)w) << "\n";
                         s.tx.erase(s.tx.begin(), s.tx.begin() + w);
                         s.last_activity_ns = now_ns();
                     }
                     if (s.tx.empty()) {
                         // done streaming, stop write notifications
-                        reg_ev(fd, EVFILT_WRITE, EV_DELETE);
+                        poller.remove(ev.fd, uma::ipc::PollFlags::Write);
                         if (s.state == uma::ipc::SessionState::ERRORED) {
                             // close errored sessions after flushing error
-                            close_session(fd);
+                            close_session(ev.fd);
                         } else if (s.state == uma::ipc::SessionState::STREAM) {
                             // finished a response
                             if (s.read_closed) {
-                                close_session(fd);
+                                close_session(ev.fd);
                             } else {
                                 s.state = uma::ipc::SessionState::RECV_REQ;
                                 s.prompt_tokens.clear();
@@ -656,7 +635,7 @@ int main(int argc, char** argv) {
                             s.state = uma::ipc::SessionState::ERRORED;
                             const std::string emsg = "error: decode failed\n";
                             s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
-                            reg_ev(s.fd, EVFILT_WRITE, EV_ADD);
+                            poller.add(s.fd, uma::ipc::PollFlags::Write);
                         }
                     } else {
                         // Read logits rows only for positions where logits==1, in push order
@@ -732,7 +711,7 @@ int main(int argc, char** argv) {
                                     s.last_activity_ns = now_ns();
                                 }
                                 if (!s.tx.empty())
-                                    reg_ev(s.fd, EVFILT_WRITE, EV_ADD);
+                                    poller.add(s.fd, uma::ipc::PollFlags::Write);
                                 else if (s.state == uma::ipc::SessionState::STREAM) {
                                     if (s.read_closed) {
                                         close_session(s.fd);
