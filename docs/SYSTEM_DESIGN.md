@@ -38,31 +38,40 @@ Components:
 
 ## Modules & Interfaces
 
-runtime/model
-- LlamaBackendGuard
-- ModelHandle { get(), new_context(), default_ctx_params() }
+Layering (mechanism vs policy):
 
-ipc
-- Poller (kqueue/epoll): register(fd, read/write), wait(timeout), wake() [user event/eventfd]
-- UdsServer: open(path, mode), accept(), close()
-- Codec (Phase‑1: newline; Phase‑2: framed JSON): read_frame(), write_frame()
-- Session { fd, rx, tx, seq, state, prompt_tokens, generated_count, last_activity }
-- SessionManager: add/remove/find; idle sweeps
+- Engine (runtime/)
+  - Thin wrapper around llama.cpp providing a stable interface independent of scheduling policy.
+  - LlamaBackendGuard; ModelHandle { get(), new_context(), default_ctx_params() }.
+  - IModelEngine (concept):
+    - capabilities() → { paged_kv, unified_kv, persistent_graph, max_batch, device_kind }
+    - tokenize(), token_to_piece()
+    - decode(batch) once per tick; logits_view(i)
+    - kv: clear(seq), snapshot(prefix_id), restore(prefix_id) [when supported]
 
-sched
-- Scheduler: tick(pool) → vector<fd_to_write>
-  - Inputs: SessionPool, llama_context, llama_vocab, config, metrics
-  - Outputs: per‑session mutations (state, tx, pending_tok)
-  - Policy hooks: budget provider, fairness, latency guard, admission
+- IPC (ipc/)
+  - Poller (kqueue/epoll): add/del interests, wait(timeout_ms), future wake().
+  - UdsServer: bind/listen/accept; socket lifecycle.
+  - Protocol/codec: Phase‑1 newline; Phase‑2 framed JSON (read_frame/write_frame).
+  - Session: { fd, rx, tx, seq, state, prompt_tokens, generated_count, last_activity, read_closed }.
+  - SessionManager (optional class; helpers now): add/remove/lookup; idle sweeps; teardown.
 
-sampler
-- SamplerChain: greedy/top‑p/top‑k, repetition/frequency penalties, temperature
+- Scheduler (sched/)
+  - IScheduler: tick(pool, now) → batch plan and I/O intents.
+  - Current baseline: two‑phase plan (DECODE 1 token; PREFILL chunks), adaptive budget, latency guard.
+  - Policy hooks (injectable later): IBatchPolicy, ILatencyGuard, IAdmissionControl.
 
-metrics
-- Metrics: counters/timers; to_json(); optional exporter later
+- Sampler
+  - SamplerChain: greedy/top‑p/top‑k, repetition/frequency penalties, temperature; zero‑copy logits view.
 
-cli
-- uma‑cli: connects to UDS, sends JSON request, prints streamed events
+- Metrics
+  - Counters/timers; to_json snapshot; exporter later.
+
+- CLI
+  - uma‑cli: connects to UDS, sends JSON request, prints streamed events.
+
+Multi‑model & routing (later):
+- ModelRegistry managing multiple Engine instances; Router picks target by model id/device/QoS; each engine has its own scheduler or one global scheduler with per‑engine capacity.
 
 ---
 
@@ -81,6 +90,12 @@ Wakeups:
 Thread‑safety:
 - Single writer per session (scheduler/output); I/O thread only appends to rx and drains tx behind readiness checks.
 - Lockless MPSC ring for work notifications; otherwise coarse‑grained mutex around SessionPool map.
+
+Session Manager (role):
+- Own fd→ClientSession map; assign seq ids.
+- Teardown: deregister poller interests, clear per‑seq KV, close fd, erase.
+- Housekeeping: idle timeout sweep; reset state after STREAM to RECV_REQ.
+- Optional helpers: drain_write(), parse_newline(); input guards via small utils.
 
 ---
 
@@ -104,6 +119,11 @@ Next steps:
 Correctness:
 - Track the exact batch index for each logits=true entry; call llama_get_logits_ith(ctx, index) post‑decode.
 
+Extensibility hooks:
+- Admission/QoS: tag sessions; budget tokens per class; preempt background when interactive SLO at risk.
+- Prompt cache: consult cache before PREFILL; on hit, restore KV snapshot and skip prefill work.
+- Paged KV: account for residency cost in batch policy (ΣBMT).
+
 ---
 
 ## Memory & KV Management
@@ -114,6 +134,10 @@ Correctness:
   - Key: hash(prefix_tokens); Value: KV snapshot handle
   - Restore on matching prefixes to skip PREFILL.
   - LRU with memory cap; metrics for hit ratio.
+
+Paged KV (tiered on UMA):
+- IKvManager: allocate/clear(seq), snapshot/restore(prefix), evict; residency hints (device/host/tier‑2).
+- Scheduler consults residency/cost; ΣBMT bandwidth‑aware policy shapes batch to balance latency/throughput.
 
 ---
 
@@ -133,21 +157,68 @@ Phase‑2: framed JSON over UDS
 
 Backpressure: TX ring per session, arm write readiness only when pending bytes; enforce per‑session TX cap.
 
+Transport vs protocol separation:
+- Transport: UDS (now), HTTP/SSE (later) over ITransport.
+- Protocol: framed JSON over IProtocol (request→events); newline preserved for debug mode.
+
 ---
 
 ## Metrics & Observability
 
-Metrics (initial): tokens_generated_total, batch_calls_total, last_batch_size, decode_ms_last, decode_ms_ewma, active_sessions.
+Metrics plan (phased, low overhead):
 
-Later:
-- Histograms: ttft_ms, inter_token_ms, decode_ms, batch_size.
-- Gauges: kv_bytes, cache_entries, ready_sessions, queued_background.
-- /metrics endpoint (JSON) without blocking compute; option to dump on signal.
+Phase 1.5 (now → short term)
+- Counters (atomics):
+  - `tokens_generated_total`, `prompts_total`, `batch_calls_total`, `decode_errors_total`, `io_errors_total`, `sessions_active`.
+- Per‑tick gauges (last values):
+  - `last_batch_size`, `decode_ms_last`, `decode_ms_ewma`, `budget_target`, `budget_used`.
+- Per‑request SLO fields (kept in session, aggregated globally):
+  - `req_start_ns`, `first_emit_ns`, `last_emit_ns`, `tokens_in_response` → derive `ttft_ms` and inter‑token deltas.
+- Scheduler decisions:
+  - `prefill_tokens_merged_last`, `decode_tokens_merged_last`, `skipped_prefill_due_to_latency_total`.
+- /metrics JSON snapshot (cheap):
+  - Return counters + last gauges + EWMA + active_sessions; bounded JSON size.
+
+Phase 2 (after refactor)
+- Histograms (power‑of‑two buckets; atomic counters):
+  - `ttft_ms`, `inter_token_ms`, `decode_ms`, `batch_size`.
+  - Implementation: fixed bucket edges (e.g., 1,2,4,…,1024 ms) to avoid locks; snapshot sums per bucket.
+- Queues/gauges:
+  - `ready_sessions`, `queued_interactive`, `queued_background`, `avg_budget_target`, `avg_budget_used`.
+- Cache/KV:
+  - Prompt cache: `lookups_total`, `hits_total`, `hit_ratio`, `snapshots_total`, `evictions_total`, `bytes_current`.
+  - Paged KV: `pages_in_total`, `pages_out_total`, `resident_dev_bytes`, `resident_host_bytes`.
+- I/O:
+  - `accepted_total`, `closed_total`, `rx_bytes_total`, `tx_bytes_total`.
+
+Phase 2.5 (optional)
+- Percentiles (approx):
+  - T‑Digest or HDR‑like structure for `ttft_ms` and `inter_token_ms` if needed; otherwise export histograms only.
+- Trace hooks (UMA_DEBUG only):
+  - Per‑token timestamps and per‑tick batch composition for short windows.
+
+Measurement points (instrumentation sites):
+- Read path (main): when newline parsed → set `req_start_ns`.
+- Scheduler tick: surround `llama_decode` for `decode_ms_last`; record `last_batch_size`, `budget_used`, `prefill/decode merged` counts.
+- Sampling: on first piece enqueued per request → set `first_emit_ns`; on every piece → update `last_emit_ns`, increment `tokens_generated_total`.
+- Write drain: on STREAM completion → finalize per‑request metrics; update histograms.
+
+Overhead guidance:
+- Atomics for counters; fixed‑size arrays for histograms; avoid heap allocs in hot path.
+- Use `steady_clock` and store raw `ns` in sessions; convert to ms only on snapshot.
+- Keep `/metrics` snapshot O(1) in size and time; avoid iterating all sessions.
+
+Exposure:
+- `/metrics` UDS admin request (JSON line) — present; extend with new fields.
+- Future: optional Prometheus text format endpoint or file dump on signal.
 
 Logs:
 - UMA_DEBUG=1 verbose traces for scheduler decisions; otherwise concise info/warn/error lines with session id and seq.
 
 Tracing (optional): token timestamps per session; batch composition.
+
+SLOs & scorecards:
+- Track TTFT (p50/p95), inter‑token latency, decode_ms, batch size; expose /metrics snapshot for quick troubleshooting.
 
 ---
 
@@ -162,6 +233,9 @@ Key knobs:
 Tuning guidance:
 - Start conservative target; let EWMA grow.
 - Keep n_ctx realistic for model size; document memory footprint.
+
+Capability detection:
+- Engine advertises capabilities(); features (persistent graphs, paged KV) are enabled opportunistically without code churn.
 
 ---
 
@@ -194,8 +268,9 @@ Phase A (minimal risk):
 - Keep newline protocol; behavior identical.
 
 Phase B (extraction):
-- Extract Scheduler class; move batch build + llama_decode + sampling.
-- Keep policy and metrics intact.
+- Extract Scheduler class; move batch build + llama_decode + sampling (no behavior change).
+- Keep policy and metrics intact; add unit tests for logits mapping.
+- Introduce tokenization helpers (runtime/tokens): wrap llama_tokenize/token_to_piece and replace direct calls in scheduler/IPC code.
 
 Phase C (protocol):
 - Add framed JSON codec and request router; retain newline fallback behind a flag.
@@ -204,7 +279,7 @@ Phase D (threads):
 - Split I/O and compute threads; add sampler/output thread optionally; use ring buffers and condition variables.
 
 Phase E (wedge features):
-- Prefix/KV snapshot cache; admission control; cancellation; deadline‑aware preemption.
+- Prefix/KV snapshot cache; admission/QoS; cancellation; deadline‑aware preemption; ΣBMT‑aware policy.
 
 Each phase should pass M1/M2/M3 smoke tests; add metrics before splitting threads to observe regressions.
 
@@ -225,6 +300,11 @@ Each phase should pass M1/M2/M3 smoke tests; add metrics before splitting thread
 - Multi‑tenant isolation and quotas in UDS mode?
 - Zero‑copy logits access on GPUs (Metal/Vulkan) practical path?
 
+UMA‑specific wedges:
+- ΣBMT bandwidth‑aware scheduler: integrate cost model (weights slice + KV + intermeds) into batch shaping.
+- Persistent Metal graph for decode: enable when available via Engine capabilities.
+- CPU/GPU coop: offload sampler and small ops; keep device busy.
+
 ---
 
 ## Roadmap (summary)
@@ -235,4 +315,3 @@ Each phase should pass M1/M2/M3 smoke tests; add metrics before splitting thread
 4) Split threads; sampler overlap.
 5) Prefix cache + cancellation + deadline‑aware policy.
 6) Speculative decoding prototype.
-
