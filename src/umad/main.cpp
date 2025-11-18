@@ -6,6 +6,7 @@
 #include "metrics/metrics.h"
 #include "runtime/config.h"
 #include "runtime/model.h"
+#include "util/logging.h"
 
 #include "llama.h"
 
@@ -103,13 +104,8 @@ bool is_valid_utf8(const std::string& s) {
 
 int main(int argc, char** argv) {
     try {
-        // Debug toggle via env UMA_DEBUG
-        if (const char* d = std::getenv("UMA_DEBUG")) {
-            std::string v(d);
-            for (auto& c : v)
-                c = (char)std::tolower(c);
-            g_debug = (v == "1" || v == "true" || v == "yes" || v == "on");
-        }
+        // Configure logging (UMA_LOG_LEVEL / UMA_DEBUG)
+        uma::util::Logger::instance().configure_from_env();
 
         // Parse config (YAML later)
         RuntimeConfig cfg;
@@ -157,11 +153,9 @@ int main(int argc, char** argv) {
         std::cout << "Context ready: n_ctx_resolved=" << llama_n_ctx(admin_ctx.get())
                   << " n_batch_resolved=" << llama_n_batch(admin_ctx.get())
                   << " n_threads=" << cfg.n_threads << "\n";
-        if (g_debug) {
-            std::cerr << "[debug] model_has_encoder="
-                      << (llama_model_has_encoder(model.get()) ? "true" : "false")
-                      << " n_seq_max=" << llama_n_seq_max(admin_ctx.get()) << "\n";
-        }
+        UMA_LOG_DEBUG() << "model_has_encoder="
+                        << (llama_model_has_encoder(model.get()) ? "true" : "false")
+                        << " n_seq_max=" << llama_n_seq_max(admin_ctx.get());
 
         // UDS server (kqueue, multi-client)
         uma::ipc::UDSServer server(cfg.socket_path, cfg.socket_mode);
@@ -270,9 +264,7 @@ int main(int argc, char** argv) {
                         sess->last_activity_ns = now_ns();
                         sessions[cfd] = std::move(sess);
                         poller.add(cfd, uma::ipc::PollFlags::Read);
-                        if (g_debug)
-                            std::cerr << "[accept] fd=" << cfd << " sessions=" << sessions.size()
-                                      << "\n";
+                        UMA_LOG_DEBUG() << "[accept] fd=" << cfd << " sessions=" << sessions.size();
                     }
                 } else if (ev.readable()) {
                     // client read
@@ -389,9 +381,8 @@ int main(int argc, char** argv) {
                                 // if needed.
                                 ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
                                 if (w > 0) {
-                                    if (g_debug)
-                                        std::cerr << "[write-now] fd=" << ev.fd
-                                                  << " wrote(prompt)=" << w << "\n";
+                                    UMA_LOG_DEBUG()
+                                            << "[write-now] fd=" << ev.fd << " wrote(prompt)=" << w;
                                     s.tx.erase(s.tx.begin(), s.tx.begin() + w);
                                 }
                                 if (!s.tx.empty())
@@ -403,9 +394,8 @@ int main(int argc, char** argv) {
                             if (s.seq < 0)
                                 s.seq = next_seq_id++;
                             s.state = uma::ipc::SessionState::PREFILL;
-                            if (g_debug)
-                                std::cerr << "[prompt] fd=" << ev.fd << " seq=" << s.seq
-                                          << " n_prompt=" << n_prompt << "\n";
+                            UMA_LOG_DEBUG() << "[prompt] fd=" << ev.fd << " seq=" << s.seq
+                                            << " n_prompt=" << n_prompt;
                         } else {
                             // empty prompt -> immediate newline
                             s.tx.push_back('\n');
@@ -426,9 +416,8 @@ int main(int argc, char** argv) {
                             close_session(ev.fd);
                             goto next_event;
                         }
-                        if (g_debug)
-                            std::cerr << "[write] fd=" << ev.fd << " wrote=" << w
-                                      << " tx_left=" << (s.tx.size() - (size_t)w) << "\n";
+                        UMA_LOG_DEBUG() << "[write] fd=" << ev.fd << " wrote=" << w
+                                        << " tx_left=" << (s.tx.size() - (size_t)w);
                         s.tx.erase(s.tx.begin(), s.tx.begin() + w);
                         s.last_activity_ns = now_ns();
                     }
@@ -494,8 +483,6 @@ int main(int argc, char** argv) {
                 // Split ready sessions
                 std::vector<int> ready_decode;
                 std::vector<int> ready_prefill;
-                ready_decode.reserve(sessions.size());
-                ready_prefill.reserve(sessions.size());
                 for (auto& kv : sessions) {
                     auto& s = *kv.second;
                     if (s.state == uma::ipc::SessionState::DECODE && s.has_pending_tok) {
@@ -534,26 +521,8 @@ int main(int argc, char** argv) {
                     rr_cursor_decode = (rr_cursor_decode + 1) % ready_decode.size();
                 }
 
-                // Latency guard: if any DECODE session has waited too long for emit, skip PREFILL
-                // this tick
-                bool skip_prefill = false;
-                if (!ready_decode.empty()) {
-                    uint64_t nowt = now_ns();
-                    for (int fd : ready_decode) {
-                        auto it = sessions.find(fd);
-                        if (it == sessions.end())
-                            continue;
-                        auto& s = *it->second;
-                        // 150ms inactivity on writes is a simple heuristic for interactivity
-                        if (nowt - s.last_activity_ns > 150ull * 1000ull * 1000ull) {
-                            skip_prefill = true;
-                            break;
-                        }
-                    }
-                }
-
                 // (B) PREFILL: drain large chunks up to remaining budget (RR over prefill sessions)
-                if (!skip_prefill && !ready_prefill.empty() && budget > 0) {
+                if (!ready_prefill.empty() && budget > 0) {
                     for (size_t i = 0; i < ready_prefill.size() && budget > 0; ++i) {
                         int fd_pick = ready_prefill[(rr_cursor_prefill + i) % ready_prefill.size()];
                         auto it = sessions.find(fd_pick);
@@ -583,7 +552,7 @@ int main(int argc, char** argv) {
                 }
 
                 if (!tokens.empty()) {
-                    if (g_debug) {
+                    {
                         std::ostringstream oss;
                         oss << "[batch] n=" << tokens.size() << " cap=" << ubatch_cap
                             << " target=" << target_batch << " items=";
@@ -591,7 +560,7 @@ int main(int argc, char** argv) {
                             oss << " (seq=" << (int)seq_id_vals[i] << ",log=" << (int)logits[i]
                                 << ")";
                         }
-                        std::cerr << oss.str() << "\n";
+                        UMA_LOG_DEBUG() << oss.str();
                     }
 
                     llama_batch batch{};
@@ -660,12 +629,11 @@ int main(int argc, char** argv) {
                                 }
                             }
                             llama_token new_id = (llama_token)best;
-                            if (g_debug)
-                                std::cerr << "[sample] fd=" << s.fd << " state_before="
-                                          << (samp.state_before == uma::ipc::SessionState::PREFILL
-                                                      ? "PREFILL"
-                                                      : "DECODE")
-                                          << " tok=" << new_id << "\n";
+                            UMA_LOG_DEBUG() << "[sample] fd=" << s.fd << " state_before="
+                                            << (samp.state_before == uma::ipc::SessionState::PREFILL
+                                                        ? "PREFILL"
+                                                        : "DECODE")
+                                            << " tok=" << new_id;
                             if (samp.state_before == uma::ipc::SessionState::PREFILL) {
                                 // transition to DECODE; feed this token next tick
                                 s.pending_tok = new_id;
@@ -704,9 +672,7 @@ int main(int argc, char** argv) {
                             if (!s.tx.empty()) {
                                 ssize_t w = ::write(s.fd, s.tx.data(), s.tx.size());
                                 if (w > 0) {
-                                    if (g_debug)
-                                        std::cerr << "[write-now] fd=" << s.fd << " wrote=" << w
-                                                  << "\n";
+                                    UMA_LOG_DEBUG() << "[write-now] fd=" << s.fd << " wrote=" << w;
                                     s.tx.erase(s.tx.begin(), s.tx.begin() + w);
                                     s.last_activity_ns = now_ns();
                                 }

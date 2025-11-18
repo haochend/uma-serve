@@ -59,7 +59,10 @@ Layering (mechanism vs policy):
 - Scheduler (sched/)
   - IScheduler: tick(pool, now) → batch plan and I/O intents.
   - Current baseline: two‑phase plan (DECODE 1 token; PREFILL chunks), adaptive budget, latency guard.
-  - Policy hooks (injectable later): IBatchPolicy, ILatencyGuard, IAdmissionControl.
+  - Policy hooks: IBatchPolicy (pure plan builder), ILatencyGuard, IAdmissionControl.
+  - Separation of concerns:
+    - IBatchPolicy: schedule_tick(SchedulerState) → Plan (no llama calls).
+    - Scheduler: executes Plan → llama_batch, calls decode(), samples, mutates sessions.
 
 - Sampler
   - SamplerChain: greedy/top‑p/top‑k, repetition/frequency penalties, temperature; zero‑copy logits view.
@@ -97,6 +100,10 @@ Session Manager (role):
 - Housekeeping: idle timeout sweep; reset state after STREAM to RECV_REQ.
 - Optional helpers: drain_write(), parse_newline(); input guards via small utils.
 
+SLO model (shared by sessions & scheduler):
+- UmaSlo { target_ttft_ms, target_tbt_ms, priority } with sane defaults.
+- Timing fields tracked per session: req_start_ns, first_emit_ns (0 if none), last_emit_ns (0 if none).
+
 ---
 
 ## Scheduling & Batching
@@ -124,6 +131,15 @@ Extensibility hooks:
 - Prompt cache: consult cache before PREFILL; on hit, restore KV snapshot and skip prefill work.
 - Paged KV: account for residency cost in batch policy (ΣBMT).
 
+Scheduler contract (explicit):
+- Lightweight state → plan → execute:
+  - SchedulerState: { sessions: vector<SessionView>, device: DeviceState, now_ns }.
+  - SessionView: { session_id, seq_id, UmaSlo, phase, prompt_tokens, generated_tokens, req_start_ns, first_emit_ns, last_emit_ns }.
+  - DeviceState: { max_batch_tokens, mem_bw_bytes_per_s, kv_bw_bytes_per_s } (start with max_batch only).
+  - Plan: vector<BatchPlan>; BatchPlan: vector<BatchItem> where BatchItem { seq_id, token_id, logits_flag }.
+- IBatchPolicy: schedule_tick(SchedulerState) → Plan.
+- Scheduler: turns Plan into llama_batch, calls decode(), reads logits rows for logits_flag==1, samples, advances session state, and returns fds to arm for write.
+
 ---
 
 ## Memory & KV Management
@@ -148,7 +164,8 @@ Phase‑1: newline framing (single‑line prompt → streamed bytes → newline 
 Phase‑2: framed JSON over UDS
 - Frame: `uint32_le length | JSON`.
 - Request:
-  - id (uuid), prompt, max_tokens, temperature, top_p/top_k, stream (bool), stop strings, seed, metadata.
+  - id (uuid), prompt, max_tokens, temperature, top_p/top_k, stream (bool), stop strings, seed, slo, metadata.
+  - `slo` (optional): `{ "target_ttft_ms": 150, "target_tbt_ms": 80, "priority": 5 }` with engine defaults if omitted.
 - Streamed events:
   - token {id, text, token_id}
   - eos {id, reason}
@@ -169,7 +186,8 @@ Metrics plan (phased, low overhead):
 
 Phase 1.5 (now → short term)
 - Counters (atomics):
-  - `tokens_generated_total`, `prompts_total`, `batch_calls_total`, `decode_errors_total`, `io_errors_total`, `sessions_active`.
+  - `tokens_generated_total`, `prompts_total`, `batch_calls_total`, `decode_errors_total`, `io_errors_total`, `sessions_active`,
+    `slo_violations_ttft_total`, `slo_violations_tbt_total`.
 - Per‑tick gauges (last values):
   - `last_batch_size`, `decode_ms_last`, `decode_ms_ewma`, `budget_target`, `budget_used`.
 - Per‑request SLO fields (kept in session, aggregated globally):
@@ -271,6 +289,8 @@ Phase B (extraction):
 - Extract Scheduler class; move batch build + llama_decode + sampling (no behavior change).
 - Keep policy and metrics intact; add unit tests for logits mapping.
 - Introduce tokenization helpers (runtime/tokens): wrap llama_tokenize/token_to_piece and replace direct calls in scheduler/IPC code.
+ - Add SLO fields to ClientSession with defaults (used for metrics only in Phase‑1); record req_start/first_emit/last_emit.
+ - Add optional ITraceSink and a gated JsonlTraceSink; emit one scheduler_tick event when enabled.
 
 Phase C (protocol):
 - Add framed JSON codec and request router; retain newline fallback behind a flag.
@@ -298,6 +318,9 @@ Each phase should pass M1/M2/M3 smoke tests; add metrics before splitting thread
 
 - Speculative decoding: draft model vs. assisted heuristics timeline?
 - Multi‑tenant isolation and quotas in UDS mode?
+- Tracing (trace/)
+  - ITraceSink (optional): on_scheduler_tick(tick_id, now_ns, state_summary, plan).
+  - JsonlTraceSink: gated (UMA_TRACE=1), writes compact JSONL events for later analysis.
 - Zero‑copy logits access on GPUs (Metal/Vulkan) practical path?
 
 UMA‑specific wedges:
