@@ -3,20 +3,25 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
-#include <climits>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace uma::sched {
 
-Scheduler::Scheduler(llama_context* ctx, const llama_vocab* vocab, const runtime::RuntimeConfig cfg,
-                     uma::metrics::Metrics* m)
+Scheduler::Scheduler(llama_context* ctx, const llama_vocab* vocab,
+                     const runtime::RuntimeConfig& cfg, uma::metrics::Metrics* m)
     : ctx_(ctx), vocab_(vocab), config_(cfg), metrics_(m) {
     batch_cap_ = llama_n_batch(ctx);
     target_batch_ = std::min<int32_t>(batch_cap_, 32);
     rr_decode_idx_ = rr_prefill_idx_ = 0;
+    decode_ms_ewma_ = tick_budget_ms_;
+    if (metrics_) {
+        metrics_->set_decode_ms_ewma(decode_ms_ewma_);
+    }
 }
 
 std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
@@ -115,13 +120,13 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
 
     if (!tokens.empty()) {
         // batch arrays should be in lockstep
-        assert(n_seq_id.size()   == tokens.size());
-        assert(seq_id_vals.size()== tokens.size());
-        assert(seq_ids.size()    == tokens.size());
-        assert(logits.size()     == tokens.size());
+        assert(n_seq_id.size() == tokens.size());
+        assert(seq_id_vals.size() == tokens.size());
+        assert(seq_ids.size() == tokens.size());
+        assert(logits.size() == tokens.size());
         // ensure we don't exceed API limits
         assert(tokens.size() <= static_cast<size_t>(batch_cap_) && "batch exceeds llama_n_batch");
-        assert(tokens.size() <= static_cast<size_t>(INT32_MAX)   && "n_tokens must fit int32");
+        assert(tokens.size() <= static_cast<size_t>(INT32_MAX) && "n_tokens must fit int32");
         // logits rows must match samples count
         size_t ones = static_cast<size_t>(std::count(logits.begin(), logits.end(), 1));
         assert(ones == samples.size() && "logits==1 count must equal samples");
@@ -134,7 +139,30 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
         batch.seq_id = seq_ids.data();
         batch.logits = logits.data();
 
+        auto t0 = std::chrono::steady_clock::now();
         int dec_rc = llama_decode(ctx_, batch);
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+
+        // update metrics (if provided)
+        if (metrics_) {
+            metrics_->batch_calls_total.fetch_add(1, std::memory_order_relaxed);
+            metrics_->last_batch_size.store(static_cast<uint32_t>(tokens.size()),
+                                            std::memory_order_relaxed);
+            metrics_->decode_ms_last.store(static_cast<uint32_t>(ms + 0.5),
+                                           std::memory_order_relaxed);
+        }
+        // EWMA toward observed decode time + publish
+        decode_ms_ewma_ = 0.8 * decode_ms_ewma_ + 0.2 * ms;
+        if (metrics_)
+            metrics_->set_decode_ms_ewma(decode_ms_ewma_);
+        // Simple adaptive tuning
+        if (decode_ms_ewma_ > 1.3 * tick_budget_ms_) {
+            target_batch_ = std::max<int32_t>(8, (int32_t)(target_batch_ * 0.7));
+        } else if (decode_ms_ewma_ < 0.8 * tick_budget_ms_) {
+            target_batch_ = std::min<int32_t>(
+                    batch_cap_, target_batch_ + std::max<int32_t>(1, target_batch_ / 8));
+        }
 
         if (dec_rc != 0) {
             for (auto& sample : samples) {
@@ -182,6 +210,8 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                     if (n > 0) {
                         s.tx.insert(s.tx.end(), (uint8_t*)buf, (uint8_t*)buf + n);
                     }
+                    if (metrics_)
+                        metrics_->tokens_generated_total.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     if (llama_vocab_is_eog(vocab_, new_id) ||
                         s.generated_count >= config_.max_tokens) {
@@ -198,6 +228,9 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                         s.pending_tok = new_id;
                         s.has_pending_tok = true;
                         s.state = ipc::SessionState::DECODE;
+                        if (metrics_)
+                            metrics_->tokens_generated_total.fetch_add(1,
+                                                                       std::memory_order_relaxed);
                     }
                 }
                 if (need_arm) {

@@ -6,6 +6,7 @@
 #include "metrics/metrics.h"
 #include "runtime/config.h"
 #include "runtime/model.h"
+#include "sched/scheduler.h"
 #include "util/logging.h"
 
 #include "llama.h"
@@ -16,7 +17,6 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 #include <sys/event.h>
 #include <sys/socket.h>
@@ -29,7 +29,6 @@ using uma::runtime::RuntimeConfig;
 
 namespace {
 std::atomic<bool> g_shutdown{false};
-bool g_debug = false;
 
 void signal_handler(int sig) {
     (void)sig;
@@ -131,10 +130,8 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        std::cout << "UMA Serve daemon starting…\n";
-        if (g_debug) {
-            std::cout << "llama.cpp system info:\n" << llama_print_system_info() << "\n";
-        }
+        UMA_LOG_INFO() << "UMA Serve daemon starting…";
+        UMA_LOG_DEBUG() << "llama.cpp system info:\n" << llama_print_system_info();
 
         install_signal_handlers();
 
@@ -142,17 +139,17 @@ int main(int argc, char** argv) {
         LlamaBackendGuard backend_guard;
         ModelHandle model(cfg);
 
-        std::cout << "Model loaded: " << cfg.model_path << "\n";
-        std::cout << "n_ctx=" << cfg.n_ctx << " threads=" << cfg.n_threads
-                  << " mmap=" << (cfg.use_mmap ? "on" : "off")
-                  << " mlock=" << (cfg.use_mlock ? "on" : "off")
-                  << " kv_unified=" << (cfg.kv_unified ? "on" : "off") << "\n";
+        UMA_LOG_INFO() << "Model loaded: " << cfg.model_path;
+        UMA_LOG_INFO() << "n_ctx=" << cfg.n_ctx << " threads=" << cfg.n_threads
+                       << " mmap=" << (cfg.use_mmap ? "on" : "off")
+                       << " mlock=" << (cfg.use_mlock ? "on" : "off")
+                       << " kv_unified=" << (cfg.kv_unified ? "on" : "off");
 
         // Create a persistent admin context now so params take effect
         auto admin_ctx = model.new_context();
-        std::cout << "Context ready: n_ctx_resolved=" << llama_n_ctx(admin_ctx.get())
-                  << " n_batch_resolved=" << llama_n_batch(admin_ctx.get())
-                  << " n_threads=" << cfg.n_threads << "\n";
+        UMA_LOG_INFO() << "Context ready: n_ctx_resolved=" << llama_n_ctx(admin_ctx.get())
+                       << " n_batch_resolved=" << llama_n_batch(admin_ctx.get())
+                       << " n_threads=" << cfg.n_threads;
         UMA_LOG_DEBUG() << "model_has_encoder="
                         << (llama_model_has_encoder(model.get()) ? "true" : "false")
                         << " n_seq_max=" << llama_n_seq_max(admin_ctx.get());
@@ -160,7 +157,7 @@ int main(int argc, char** argv) {
         // UDS server (kqueue, multi-client)
         uma::ipc::UDSServer server(cfg.socket_path, cfg.socket_mode);
         if (!server.open_listen()) {
-            std::cerr << "Failed to open UDS listen socket\n";
+            UMA_LOG_ERROR() << "Failed to open UDS listen socket";
             return 2;
         }
 
@@ -172,19 +169,11 @@ int main(int argc, char** argv) {
         llama_context* gctx = admin_ctx.get();
         const llama_vocab* vocab = llama_model_get_vocab(model.get());
         int32_t next_seq_id = 1;
-        size_t rr_cursor_decode = 0;  // RR cursor for decode fairness
-        size_t rr_cursor_prefill = 0; // RR cursor for prefill fairness
-
-        // Micro-batch capacity resolved by the context
-        const int32_t ubatch_cap = llama_n_batch(gctx);
-        // Adaptive target size (tokens per tick), start conservative
-        int32_t target_batch = std::min<int32_t>(ubatch_cap, 32);
-        const double tick_budget_ms = 30.0;     // soft budget per decode
-        double decode_ms_ewma = tick_budget_ms; // seed EWMA
 
         // Metrics (M4 stub)
         uma::metrics::Metrics mtx;
-        mtx.set_decode_ms_ewma(decode_ms_ewma);
+        // scheduler hook
+        uma::sched::Scheduler scheduler(gctx, vocab, cfg, &mtx);
 
         auto now_ns = []() {
             using namespace std::chrono;
@@ -210,7 +199,7 @@ int main(int argc, char** argv) {
             }
         };
 
-        std::cout << "Ready. Connect with: nc -U " << cfg.socket_path << "\n";
+        UMA_LOG_INFO() << "Ready. Connect with: nc -U " << cfg.socket_path;
 
         // main event loop
         while (!g_shutdown.load(std::memory_order_relaxed)) {
@@ -461,250 +450,25 @@ int main(int argc, char** argv) {
             // Two-phase policy per tick: (A) 1 token per DECODE session, (B) PREFILL drain in
             // chunks
             {
-                // Build containers with capacity up to ubatch_cap
-                std::vector<llama_token> tokens;
-                tokens.reserve(ubatch_cap);
-                std::vector<int32_t> n_seq_id;
-                n_seq_id.reserve(ubatch_cap);
-                std::vector<llama_seq_id> seq_id_vals;
-                seq_id_vals.reserve(ubatch_cap);
-                std::vector<llama_seq_id*> seq_ids;
-                seq_ids.reserve(ubatch_cap);
-                std::vector<int8_t> logits;
-                logits.reserve(ubatch_cap);
-                struct SampleRef {
-                    int fd;
-                    int batch_index;
-                    uma::ipc::SessionState state_before;
-                };
-                std::vector<SampleRef> samples;
-                samples.reserve(ubatch_cap);
-
-                // Split ready sessions
-                std::vector<int> ready_decode;
-                std::vector<int> ready_prefill;
-                for (auto& kv : sessions) {
-                    auto& s = *kv.second;
-                    if (s.state == uma::ipc::SessionState::DECODE && s.has_pending_tok) {
-                        ready_decode.push_back(s.fd);
-                    } else if (s.state == uma::ipc::SessionState::PREFILL &&
-                               s.prefill_idx < s.prompt_tokens.size()) {
-                        ready_prefill.push_back(s.fd);
-                    }
-                }
-
-                // Adaptive budget for this tick
-                int32_t budget = std::min<int32_t>(target_batch, ubatch_cap);
-                if (budget <= 0)
-                    budget = 1;
-
-                // (A) DECODE: give exactly 1 token to each ready DECODE session (RR), up to budget
-                if (!ready_decode.empty() && budget > 0) {
-                    for (size_t i = 0; i < ready_decode.size() && budget > 0; ++i) {
-                        int fd_pick = ready_decode[(rr_cursor_decode + i) % ready_decode.size()];
-                        auto it = sessions.find(fd_pick);
-                        if (it == sessions.end())
-                            continue;
-                        auto& s = *it->second;
-                        // Append the pending token
-                        llama_token t = (llama_token)s.pending_tok;
-                        s.has_pending_tok = false;
-                        tokens.push_back(t);
-                        n_seq_id.push_back(1);
-                        seq_id_vals.push_back((llama_seq_id)s.seq);
-                        seq_ids.push_back(&seq_id_vals.back());
-                        logits.push_back(1);
-                        samples.push_back(
-                                {s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::DECODE});
-                        budget--;
-                    }
-                    rr_cursor_decode = (rr_cursor_decode + 1) % ready_decode.size();
-                }
-
-                // (B) PREFILL: drain large chunks up to remaining budget (RR over prefill sessions)
-                if (!ready_prefill.empty() && budget > 0) {
-                    for (size_t i = 0; i < ready_prefill.size() && budget > 0; ++i) {
-                        int fd_pick = ready_prefill[(rr_cursor_prefill + i) % ready_prefill.size()];
-                        auto it = sessions.find(fd_pick);
-                        if (it == sessions.end())
-                            continue;
-                        auto& s = *it->second;
-                        size_t remain = s.prompt_tokens.size() - s.prefill_idx;
-                        int32_t chunk = (int32_t)std::min<size_t>(remain, (size_t)budget);
-                        if (chunk <= 0)
-                            continue;
-                        // append chunk tokens; logits only on last
-                        for (int32_t j = 0; j < chunk; ++j) {
-                            llama_token t = (llama_token)s.prompt_tokens[s.prefill_idx++];
-                            tokens.push_back(t);
-                            n_seq_id.push_back(1);
-                            seq_id_vals.push_back((llama_seq_id)s.seq);
-                            seq_ids.push_back(&seq_id_vals.back());
-                            int8_t lg = (j == chunk - 1) ? 1 : 0;
-                            logits.push_back(lg);
-                            if (lg)
-                                samples.push_back({s.fd, (int)tokens.size() - 1,
-                                                   uma::ipc::SessionState::PREFILL});
-                        }
-                        budget -= chunk;
-                    }
-                    rr_cursor_prefill = (rr_cursor_prefill + 1) % ready_prefill.size();
-                }
-
-                if (!tokens.empty()) {
-                    {
-                        std::ostringstream oss;
-                        oss << "[batch] n=" << tokens.size() << " cap=" << ubatch_cap
-                            << " target=" << target_batch << " items=";
-                        for (size_t i = 0; i < tokens.size(); ++i) {
-                            oss << " (seq=" << (int)seq_id_vals[i] << ",log=" << (int)logits[i]
-                                << ")";
-                        }
-                        UMA_LOG_DEBUG() << oss.str();
-                    }
-
-                    llama_batch batch{};
-                    batch.n_tokens = (int32_t)tokens.size();
-                    batch.token = tokens.data();
-                    batch.embd = nullptr;
-                    batch.pos = nullptr; // auto-track positions per seq
-                    batch.n_seq_id = n_seq_id.data();
-                    batch.seq_id = seq_ids.data();
-                    batch.logits = logits.data();
-
-                    auto t0 = std::chrono::steady_clock::now();
-                    int dec_rc = llama_decode(gctx, batch);
-                    auto t1 = std::chrono::steady_clock::now();
-                    double ms =
-                            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() /
-                            1000.0;
-                    // update metrics
-                    mtx.batch_calls_total.fetch_add(1, std::memory_order_relaxed);
-                    mtx.last_batch_size.store((uint32_t)tokens.size(), std::memory_order_relaxed);
-                    mtx.decode_ms_last.store((uint32_t)(ms + 0.5), std::memory_order_relaxed);
-                    // EWMA toward observed decode time
-                    decode_ms_ewma = 0.8 * decode_ms_ewma + 0.2 * ms;
-                    mtx.set_decode_ms_ewma(decode_ms_ewma);
-                    // Simple adaptive tuning
-                    if (decode_ms_ewma > 1.3 * tick_budget_ms) {
-                        target_batch = std::max<int32_t>(8, (int32_t)(target_batch * 0.7));
-                    } else if (decode_ms_ewma < 0.8 * tick_budget_ms) {
-                        target_batch = std::min<int32_t>(
-                                ubatch_cap, target_batch + std::max<int32_t>(1, target_batch / 8));
-                    }
-
-                    if (dec_rc != 0) {
-                        // On decode error, mark sessions errored
-                        for (auto& samp : samples) {
-                            auto it = sessions.find(samp.fd);
-                            if (it == sessions.end())
-                                continue;
-                            auto& s = *it->second;
-                            s.last_error = "decode error";
-                            s.state = uma::ipc::SessionState::ERRORED;
-                            const std::string emsg = "error: decode failed\n";
-                            s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
-                            poller.add(s.fd, uma::ipc::PollFlags::Write);
-                        }
-                    } else {
-                        // Read logits rows only for positions where logits==1, in push order
-                        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-                        for (size_t k = 0; k < samples.size(); ++k) {
-                            auto& samp = samples[k];
-                            auto it = sessions.find(samp.fd);
-                            if (it == sessions.end())
-                                continue;
-                            auto& s = *it->second;
-                            float* logits_row = llama_get_logits_ith(gctx, samp.batch_index);
-                            if (!logits_row)
-                                continue; // safety in non-DEBUG
-                            // greedy argmax
-                            int best = 0;
-                            float bestv = logits_row[0];
-                            for (int i = 1; i < n_vocab; ++i) {
-                                float v = logits_row[i];
-                                if (v > bestv) {
-                                    bestv = v;
-                                    best = i;
-                                }
-                            }
-                            llama_token new_id = (llama_token)best;
-                            UMA_LOG_DEBUG() << "[sample] fd=" << s.fd << " state_before="
-                                            << (samp.state_before == uma::ipc::SessionState::PREFILL
-                                                        ? "PREFILL"
-                                                        : "DECODE")
-                                            << " tok=" << new_id;
-                            if (samp.state_before == uma::ipc::SessionState::PREFILL) {
-                                // transition to DECODE; feed this token next tick
-                                s.pending_tok = new_id;
-                                s.has_pending_tok = true;
-                                s.state = uma::ipc::SessionState::DECODE;
-                                // stream first sampled token immediately
-                                char buf[256];
-                                int n = llama_token_to_piece(vocab, new_id, buf, sizeof(buf), 0,
-                                                             true);
-                                if (n > 0)
-                                    s.tx.insert(s.tx.end(), (uint8_t*)buf, (uint8_t*)buf + n);
-                                mtx.tokens_generated_total.fetch_add(1, std::memory_order_relaxed);
-                            } else {
-                                // stream piece or finish
-                                if (llama_vocab_is_eog(vocab, new_id) ||
-                                    s.generated_count >= cfg.max_tokens) {
-                                    s.tx.push_back('\n');
-                                    s.state = uma::ipc::SessionState::STREAM; // finished for now
-                                    // Clear sequence memory for reuse
-                                    llama_memory_seq_rm(llama_get_memory(gctx), s.seq, -1, -1);
-                                } else {
-                                    char buf[256];
-                                    int n = llama_token_to_piece(vocab, new_id, buf, sizeof(buf), 0,
-                                                                 true);
-                                    if (n > 0)
-                                        s.tx.insert(s.tx.end(), (uint8_t*)buf, (uint8_t*)buf + n);
-                                    s.generated_count++;
-                                    s.pending_tok = new_id;
-                                    s.has_pending_tok = true;
-                                    s.state = uma::ipc::SessionState::DECODE;
-                                    mtx.tokens_generated_total.fetch_add(1,
-                                                                         std::memory_order_relaxed);
-                                }
-                            }
-                            // try immediate drain and/or arm write readiness
-                            if (!s.tx.empty()) {
-                                ssize_t w = ::write(s.fd, s.tx.data(), s.tx.size());
-                                if (w > 0) {
-                                    UMA_LOG_DEBUG() << "[write-now] fd=" << s.fd << " wrote=" << w;
-                                    s.tx.erase(s.tx.begin(), s.tx.begin() + w);
-                                    s.last_activity_ns = now_ns();
-                                }
-                                if (!s.tx.empty())
-                                    poller.add(s.fd, uma::ipc::PollFlags::Write);
-                                else if (s.state == uma::ipc::SessionState::STREAM) {
-                                    if (s.read_closed) {
-                                        close_session(s.fd);
-                                    } else {
-                                        s.state = uma::ipc::SessionState::RECV_REQ;
-                                        s.prompt_tokens.clear();
-                                        s.prefill_idx = 0;
-                                        s.generated_count = 0;
-                                        s.has_pending_tok = false;
-                                    }
-                                }
-                            }
-                        }
+                auto fds_to_arm = scheduler.tick(sessions, now_ns());
+                for (int fd : fds_to_arm) {
+                    auto it = sessions.find(fd);
+                    if (it != sessions.end() && !it->second->tx.empty()) {
+                        poller.add(fd, uma::ipc::PollFlags::Write);
                     }
                 }
             }
         } // end main event loop
 
-        std::cout << "Shutdown requested. Draining & cleaning up…\n";
+        UMA_LOG_INFO() << "Shutdown requested. Draining & cleaning up…";
         // Contexts would be drained here when implemented.
         // Model + backend are freed by RAII destructors.
 
-        std::cout << "Goodbye.\n";
+        UMA_LOG_INFO() << "Goodbye.";
         return 0;
 
     } catch (const std::exception& e) {
-        std::cerr << "Fatal error: " << e.what() << "\n";
+        UMA_LOG_ERROR() << "Fatal error: " << e.what();
         return 1;
     }
 }
