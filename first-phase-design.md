@@ -121,7 +121,7 @@ uma-serve/
 
 ### Week 3 — Concurrent Batching v0 (M3)
 
-Implemented in daemon (single-thread scheduler) with chunked batching and correct logits mapping.
+Implemented and wired: single-thread Scheduler with chunked PREFILL, decode-first fairness, and correct logits mapping. Main loop uses Scheduler; all socket I/O stays in the EVFILT_WRITE handler.
 
 **Scheduler loop**
 
@@ -133,21 +133,22 @@ Implemented in daemon (single-thread scheduler) with chunked batching and correc
     - Phase B (PREFILL): use the remaining budget to drain prompts in large chunks per session (round-robin across sessions). Mark `logits=true` only on the last token of each per-session chunk.
   * [x] Annotate each item with `llama_seq_id = session.seq`.
   * [x] Budget = `min(target_batch, llama_n_batch(ctx))`. `target_batch` starts conservative and adapts toward a ~30 ms decode budget using an EWMA of recent decode times.
-* [x] `llama_decode(ctx, batch)` **once** per tick.
-* [x] Sampling: read logits only for entries where `logits==1`, using the exact batch index captured during build (fixes invalid `get_logits_ith()` mapping). Greedy sampling for now.
-* [x] Stream pieces into per-session `tx`; arm `EVFILT_WRITE`; transition session state.
+* [x] `llama_decode(ctx, batch)` once per tick.
+* [x] Sampling: read logits only for entries where `logits==1`, using the exact batch index captured during build (fixes invalid `get_logits_ith()` mapping). Greedy for now.
+* [x] Append pieces to per-session `tx`; return fds to arm `EVFILT_WRITE`; transition session state.
 
-**Latency guard (lightweight)**
+**Latency/Adaptation**
 
 * [x] Adaptive `target_batch` tuned by decode-time EWMA toward a ~30 ms tick budget.
-* [x] Interactivity guard: if any DECODE session has not emitted for ~150 ms, skip PREFILL for that tick (DECODE-only tick).
-* [ ] Per-session per-token latency EWMA (not yet tracked).
+* [ ] SLO-aware guard (skip/delay PREFILL when interactive SLO at risk). The earlier fixed guard was removed; we’ll add an SLO-based version.
+* [ ] Per-session latency tracking (TTFT/TBT) in metrics (planned).
 
 **Metrics (stub)**
 
-* [ ] Counters: tokens_generated_total, batch_calls_total, avg_batch_size.
-* [ ] Timers: decode_ms, sample_ms, per-token_latency_ms.
-* [ ] Expose `/metrics` JSON (single snapshot) on a debug UDS path or `SIGUSR1` dump to file (W3 minimal).
+* [x] Counters: `tokens_generated_total`, `batch_calls_total`.
+* [x] Gauges: `last_batch_size`, `decode_ms_last`, `decode_ms_ewma`.
+* [x] Admin endpoint: `/metrics` (newline request on UDS) returns one JSON line and closes.
+* [ ] Histograms (ttft_ms, inter_token_ms, decode_ms) and per-request aggregation (planned).
 
 **Acceptance (M3)**
 
@@ -262,8 +263,8 @@ Implemented policy (replaces per-token round-robin):
 - Phase B — PREFILL chunking: drain remaining budget across prefill sessions in large chunks (round-robin). Set `logits=true` only on the last token of each per-session chunk.
 - Correct logits mapping: store the batch index for every `logits=true` entry and pass that index to `llama_get_logits_ith()` after decode.
 - Fairness: separate RR cursors for DECODE and PREFILL phases to avoid starvation.
-- Latency guard: if any DECODE session’s time since last emit exceeds ~150 ms, skip PREFILL for the tick.
 - Adaptation: maintain a decode-time EWMA and nudge `target_batch` toward a ~30 ms decode budget.
+- Latency guard: removed for now; will reintroduce as an SLO-aware guard.
 
 Notes:
 
@@ -283,7 +284,9 @@ Open items:
 - Input parser guards: newline framing (W1), CR trim, NUL reject, UTF‑8 validator, prompt size cap.
 - Prompt echo: after tokenizing a prompt, the daemon immediately streams the original prompt pieces to provide early bytes on large models (helps tests avoid client timeouts).
 - Session teardown: on error/EOS/idle timeout, remove kqueue filters, close fd, and clear per-seq KV memory.
-- Logging: verbose traces (`[accept] [prompt] [batch] [sample] [write-now]`) are emitted only when `UMA_DEBUG=1`. Default logs are concise (startup, model/context info, UDS path, readiness, shutdown).
+- Logging: header-only logger (`util/logging.h`) with UMA_LOG_LEVEL/UMA_DEBUG; debug traces (`[accept] [prompt] [batch] [sample] [write-now]`) gated under DEBUG; default logs concise (startup, model/context info, UDS path, readiness, shutdown).
+- Scheduler: extracted into `sched/`; main calls `sched.tick()` and only arms write; no I/O in scheduler.
+- Admin `/metrics`: returns compact JSON snapshot and closes; intended for dev/admin only.
 - Event loop: dynamic timeout (no sleep when work exists; idle sleep when not) to avoid stalling compute work on single/few-session loads.
 
 ---
@@ -300,9 +303,9 @@ Open items:
 Known limitations (Phase 1):
 - Newline-based protocol only; framed JSON not implemented yet.
 - Single-threaded scheduler (decode + sampling on main thread).
-- Fixed kqueue wait (200 ms) when idle; no-sleep fast path when work exists is a next step.
-- Metrics endpoint not implemented; batch size and latency are not recorded yet.
-- macOS kqueue path only; Linux epoll path to add.
+- No EVFILT_USER/eventfd wakeups yet; dynamic zero-timeout used when work exists.
+- Metrics are a stub (no histograms; minimal counters only).
+- macOS kqueue path only; Linux epoll backend to add.
 
 ### 5) Error Handling & Codes
 
@@ -315,10 +318,8 @@ Known limitations (Phase 1):
 
 ### 6) Logging
 
-* **Binary perf log (Phase 2);** in Phase 1:
-
-  * [ ] Text log (INFO/WARN/ERR) with timestamps, session id, seq.
-  * [ ] Per-tick counters: batch size, tokens emitted, decode_ms.
+* **Phase 1:** header-only logger; INFO/WARN/ERR by default; DEBUG with UMA_DEBUG/UMA_LOG_LEVEL=debug.
+* **Phase 2:** structured/perf logging (binary or JSONL) + optional trace sink.
 
 ### 7) Build Flags (CMake)
 
@@ -406,11 +407,11 @@ metrics:
 
 **`src/sched/scheduler.{h,cc}`**
 
-* [ ] `tick(SessionPool&)` → `llama_batch` → `decode()` → per-session sample.
+* [x] `tick(SessionPool&)` → build batch → `decode()` → sample → mutate sessions → fds to write.
 
 **`src/metrics/metrics.{h,cc}`**
 
-* [ ] Atomic counters/timers; `snapshot()` → JSON.
+* [x] Minimal counters/gauges; `to_json()` → JSON line for admin endpoint.
 
 **`src/cli/main.cc`**
 
@@ -424,7 +425,7 @@ metrics:
 * [x] 4 concurrent sessions stream tokens; no memory growth > contexts (smoke level).
 * [x] Interleaved tokens across sessions with global `llama_decode`.
 * [ ] Framed JSON protocol stable to partial reads/writes.
-* [ ] `uma-cli` usable; `/metrics` returns JSON without blocking.
+* [ ] `uma-cli` usable; [x] `/metrics` returns JSON without blocking.
 * [ ] Minimal docs: `README`, `PROTOCOL`, quickstart.
 
 ---

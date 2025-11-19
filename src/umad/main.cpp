@@ -2,12 +2,15 @@
 
 #include "ipc/poller.h"
 #include "ipc/session.h"
+#include "ipc/session_manager.h"
 #include "ipc/uds_server.h"
 #include "metrics/metrics.h"
 #include "runtime/config.h"
 #include "runtime/model.h"
+#include "runtime/tokens.h"
 #include "sched/scheduler.h"
 #include "util/logging.h"
+#include "util/utf8.h"
 
 #include "llama.h"
 
@@ -164,11 +167,11 @@ int main(int argc, char** argv) {
         uma::ipc::Poller poller;
         poller.add(server.fd(), uma::ipc::PollFlags::Read);
 
-        // session pool
-        uma::ipc::SessionPool sessions;
+        // sessions
+        uma::ipc::SessionManager sessions;
         llama_context* gctx = admin_ctx.get();
         const llama_vocab* vocab = llama_model_get_vocab(model.get());
-        int32_t next_seq_id = 1;
+        // session seq ids are managed by SessionManager
 
         // Metrics (M4 stub)
         uma::metrics::Metrics mtx;
@@ -180,25 +183,6 @@ int main(int argc, char** argv) {
             return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
         };
 
-        auto close_session = [&](int cfd) {
-            // deregister filters
-            poller.remove(cfd, uma::ipc::PollFlags::Read | uma::ipc::PollFlags::Write);
-
-            auto it = sessions.find(cfd);
-            if (it != sessions.end()) {
-                // clear sequence KV memory for reuse
-                if (it->second->seq >= 0) {
-                    llama_memory_seq_rm(llama_get_memory(gctx), it->second->seq, -1, -1);
-                }
-                if (it->second->ctx)
-                    llama_free(it->second->ctx);
-                ::close(cfd);
-                sessions.erase(it);
-            } else {
-                ::close(cfd);
-            }
-        };
-
         UMA_LOG_INFO() << "Ready. Connect with: nc -U " << cfg.socket_path;
 
         // main event loop
@@ -206,7 +190,7 @@ int main(int argc, char** argv) {
             struct kevent events[64];
             // Dynamic timeout: if any session has ready work, don't sleep; otherwise idle for 200ms
             bool has_ready_work = false;
-            for (auto& kv : sessions) {
+            for (auto& kv : sessions.map()) {
                 auto& s = *kv.second;
                 if ((s.state == uma::ipc::SessionState::PREFILL &&
                      s.prefill_idx < s.prompt_tokens.size()) ||
@@ -243,166 +227,55 @@ int main(int argc, char** argv) {
                         int one = 1;
                         ::setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-                        if (sessions.size() >= cfg.max_sessions) {
+                        if (sessions.map().size() >= cfg.max_sessions) {
                             ::close(cfd);
                             continue;
                         }
-                        auto sess = std::make_unique<uma::ipc::ClientSession>();
-                        sess->fd = cfd;
-                        sess->ctx = nullptr; // using global context for M3 batching
-                        sess->last_activity_ns = now_ns();
-                        sessions[cfd] = std::move(sess);
+                        sessions.add_client(cfd, now_ns());
                         poller.add(cfd, uma::ipc::PollFlags::Read);
-                        UMA_LOG_DEBUG() << "[accept] fd=" << cfd << " sessions=" << sessions.size();
+                        UMA_LOG_DEBUG() << "[accept] fd=" << cfd;
                     }
                 } else if (ev.readable()) {
-                    // client read
-                    auto it = sessions.find(ev.fd);
-                    if (it == sessions.end())
-                        continue;
-                    auto& s = *it->second;
-                    uint8_t buf[4096];
-                    bool saw_eof = false;
-                    for (;;) {
-                        ssize_t n = ::read(ev.fd, buf, sizeof(buf));
-                        if (n > 0) {
-                            if (s.rx.size() + (size_t)n > cfg.max_prompt_bytes) {
-                                const std::string msg = "error: prompt too large (limit " +
-                                                        std::to_string(cfg.max_prompt_bytes) +
-                                                        ")\n";
-                                s.tx.insert(s.tx.end(), msg.begin(), msg.end());
-                                s.state = uma::ipc::SessionState::ERRORED;
-                                poller.remove(ev.fd, uma::ipc::PollFlags::Read);
-                                poller.add(ev.fd, uma::ipc::PollFlags::Write);
-                                break;
-                            }
-                            s.rx.insert(s.rx.end(), buf, buf + n);
-                            s.last_activity_ns = now_ns();
-                            continue; // try to drain more
-                        }
-                        if (n == 0) {
-                            saw_eof = true;
-                            break;
-                        }
-                        if (errno == EAGAIN || errno == EWOULDBLOCK)
-                            break;
-                        // other error
-                        close_session(ev.fd);
-                        goto next_event;
-                    }
-                    if (saw_eof) {
+                    // client read via SessionManager
+                    auto rr = sessions.on_readable(ev.fd, cfg, vocab, now_ns());
+                    auto* sp = sessions.find(ev.fd);
+                    if (!sp) goto next_event;
+                    auto& s = *sp;
+                    if (rr.admin_request) {
+                        std::string js = mtx.to_json((uint32_t)sessions.map().size());
+                        s.tx.insert(s.tx.end(), js.begin(), js.end());
+                        s.tx.push_back('\n');
+                        // One-shot admin response: close after flushing
+                        s.state = uma::ipc::SessionState::STREAM;
                         s.read_closed = true;
                         poller.remove(ev.fd, uma::ipc::PollFlags::Read);
-                        s.last_activity_ns = now_ns();
+                        rr.wants_write = true;
                     }
-                    // Check for newline-terminated prompt
-                    auto nl = std::find(s.rx.begin(), s.rx.end(), (uint8_t)'\n');
-                    if (nl != s.rx.end()) {
-                        std::string prompt(s.rx.begin(), nl);
-                        s.rx.erase(s.rx.begin(), nl + 1);
-                        if (s.state != uma::ipc::SessionState::RECV_REQ) {
-                            const std::string emsg = "error: busy\n";
-                            s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
-                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
-                            continue;
+                    if (rr.removed_read) {
+                        poller.remove(ev.fd, uma::ipc::PollFlags::Read);
+                    }
+                    if (rr.wants_write && !s.tx.empty()) {
+                        // Try an immediate non-blocking drain; then arm write notifications if needed.
+                        ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
+                        if (w > 0) {
+                            UMA_LOG_DEBUG() << "[write-now] fd=" << ev.fd << " wrote(rx)=" << w;
+                            s.tx.erase(s.tx.begin(), s.tx.begin() + w);
                         }
-                        // Admin: metrics endpoint via UDS prompt
-                        if (prompt == "/metrics" || prompt == "metrics") {
-                            std::string js = mtx.to_json((uint32_t)sessions.size());
-                            s.tx.insert(s.tx.end(), js.begin(), js.end());
-                            s.tx.push_back('\n');
-                            // One-shot admin response: close after flushing
-                            s.state = uma::ipc::SessionState::STREAM;
-                            s.read_closed = true; // trigger close after tx drains
-                            poller.remove(ev.fd, uma::ipc::PollFlags::Read);
+                        if (!s.tx.empty())
                             poller.add(ev.fd, uma::ipc::PollFlags::Write);
-                            continue;
-                        }
-                        // trim trailing CR
-                        if (!prompt.empty() && prompt.back() == '\r')
-                            prompt.pop_back();
-                        // reject embedded NUL
-                        if (prompt.find('\0') != std::string::npos) {
-                            const std::string emsg = "error: invalid input (NUL)\n";
-                            s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
-                            s.state = uma::ipc::SessionState::ERRORED;
-                            poller.remove(ev.fd, uma::ipc::PollFlags::Read);
-                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
-                            continue;
-                        }
-                        // UTF-8 validation
-                        if (!is_valid_utf8(prompt)) {
-                            const std::string emsg = "error: invalid utf-8\n";
-                            s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
-                            s.state = uma::ipc::SessionState::ERRORED;
-                            poller.remove(ev.fd, uma::ipc::PollFlags::Read);
-                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
-                            continue;
-                        }
-                        // tokenize prompt and transition to PREFILL
-                        s.prompt_tokens.clear();
-                        const int n_prompt = -llama_tokenize(
-                                vocab, prompt.c_str(), (int)prompt.size(), nullptr, 0, true, true);
-                        if (n_prompt > 0) {
-                            s.prompt_tokens.resize((size_t)n_prompt);
-                            if (llama_tokenize(vocab, prompt.c_str(), (int)prompt.size(),
-                                               (llama_token*)s.prompt_tokens.data(), n_prompt, true,
-                                               true) < 0) {
-                                const std::string emsg = "error: tokenize failed\n";
-                                s.tx.insert(s.tx.end(), emsg.begin(), emsg.end());
-                                s.state = uma::ipc::SessionState::ERRORED;
-                                poller.remove(ev.fd, uma::ipc::PollFlags::Read);
-                                poller.add(ev.fd, uma::ipc::PollFlags::Write);
-                                continue;
-                            }
-                            // For responsiveness (esp. on large models), echo the prompt pieces
-                            // immediately. This guarantees clients see bytes even before first
-                            // decode completes.
-                            for (int id : s.prompt_tokens) {
-                                char pbuf[256];
-                                int pn = llama_token_to_piece(vocab, (llama_token)id, pbuf,
-                                                              sizeof(pbuf), 0, true);
-                                if (pn > 0)
-                                    s.tx.insert(s.tx.end(), (uint8_t*)pbuf, (uint8_t*)pbuf + pn);
-                            }
-                            if (!s.tx.empty()) {
-                                // Try an immediate non-blocking drain; then arm write notifications
-                                // if needed.
-                                ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
-                                if (w > 0) {
-                                    UMA_LOG_DEBUG()
-                                            << "[write-now] fd=" << ev.fd << " wrote(prompt)=" << w;
-                                    s.tx.erase(s.tx.begin(), s.tx.begin() + w);
-                                }
-                                if (!s.tx.empty())
-                                    poller.add(ev.fd, uma::ipc::PollFlags::Write);
-                            }
-                            s.prefill_idx = 0;
-                            s.generated_count = 0;
-                            s.has_pending_tok = false;
-                            if (s.seq < 0)
-                                s.seq = next_seq_id++;
-                            s.state = uma::ipc::SessionState::PREFILL;
-                            UMA_LOG_DEBUG() << "[prompt] fd=" << ev.fd << " seq=" << s.seq
-                                            << " n_prompt=" << n_prompt;
-                        } else {
-                            // empty prompt -> immediate newline
-                            s.tx.push_back('\n');
-                            poller.add(ev.fd, uma::ipc::PollFlags::Write);
-                        }
                     }
                 } else if (ev.writable()) {
                     // client write
-                    auto it = sessions.find(ev.fd);
-                    if (it == sessions.end())
+                    auto* itp = sessions.find(ev.fd);
+                    if (!itp)
                         continue;
-                    auto& s = *it->second;
+                    auto& s = *itp;
                     while (!s.tx.empty()) {
                         ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
                         if (w < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK)
                                 break;
-                            close_session(ev.fd);
+                            sessions.close(ev.fd, poller, gctx);
                             goto next_event;
                         }
                         UMA_LOG_DEBUG() << "[write] fd=" << ev.fd << " wrote=" << w
@@ -415,11 +288,11 @@ int main(int argc, char** argv) {
                         poller.remove(ev.fd, uma::ipc::PollFlags::Write);
                         if (s.state == uma::ipc::SessionState::ERRORED) {
                             // close errored sessions after flushing error
-                            close_session(ev.fd);
+                            sessions.close(ev.fd, poller, gctx);
                         } else if (s.state == uma::ipc::SessionState::STREAM) {
                             // finished a response
                             if (s.read_closed) {
-                                close_session(ev.fd);
+                                sessions.close(ev.fd, poller, gctx);
                             } else {
                                 s.state = uma::ipc::SessionState::RECV_REQ;
                                 s.prompt_tokens.clear();
@@ -437,23 +310,23 @@ int main(int argc, char** argv) {
             uint64_t now = now_ns();
             uint64_t idle_ns = (uint64_t)cfg.idle_timeout_sec * 1000ull * 1000ull * 1000ull;
             std::vector<int> to_close;
-            for (auto& kv : sessions) {
+            for (auto& kv : sessions.map()) {
                 auto& s = *kv.second;
                 if (idle_ns > 0 && now - s.last_activity_ns > idle_ns) {
                     to_close.push_back(s.fd);
                 }
             }
             for (int fd_c : to_close)
-                close_session(fd_c);
+                sessions.close(fd_c, poller, gctx);
 
             // ---- M3 Scheduler tick: build global batch from ready sessions ----
             // Two-phase policy per tick: (A) 1 token per DECODE session, (B) PREFILL drain in
             // chunks
             {
-                auto fds_to_arm = scheduler.tick(sessions, now_ns());
+                auto fds_to_arm = scheduler.tick(sessions.map(), now_ns());
                 for (int fd : fds_to_arm) {
-                    auto it = sessions.find(fd);
-                    if (it != sessions.end() && !it->second->tx.empty()) {
+                    auto* itp = sessions.find(fd);
+                    if (itp && !itp->tx.empty()) {
                         poller.add(fd, uma::ipc::PollFlags::Write);
                     }
                 }

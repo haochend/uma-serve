@@ -22,9 +22,11 @@ add_executable(umad
     src/umad/main.cpp
     src/runtime/config.cpp
     src/runtime/model.cpp
+    src/runtime/tokens.cpp
     src/sched/scheduler.cpp
     src/metrics/metrics.cpp
     src/ipc/uds_server.cpp
+    src/ipc/session_manager.cpp
 )
 
 # Platform-specific sources

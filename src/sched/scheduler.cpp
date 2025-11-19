@@ -1,6 +1,7 @@
 #include "sched/scheduler.h"
 #include "ipc/session.h"
 #include "llama.h"
+#include "runtime/tokens.h"
 
 #include <algorithm>
 #include <atomic>
@@ -205,10 +206,11 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                     s.pending_tok = new_id;
                     s.has_pending_tok = true;
                     s.state = ipc::SessionState::DECODE;
-                    char buf[256];
-                    int n = llama_token_to_piece(vocab_, new_id, buf, sizeof(buf), 0, true);
-                    if (n > 0) {
-                        s.tx.insert(s.tx.end(), (uint8_t*)buf, (uint8_t*)buf + n);
+                    {
+                        std::string piece = uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
+                        if (!piece.empty()) {
+                            s.tx.insert(s.tx.end(), piece.begin(), piece.end());
+                        }
                     }
                     if (metrics_)
                         metrics_->tokens_generated_total.fetch_add(1, std::memory_order_relaxed);
@@ -219,10 +221,11 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                         s.state = ipc::SessionState::STREAM;
                         llama_memory_seq_rm(llama_get_memory(ctx_), s.seq, -1, -1);
                     } else {
-                        char buf[256];
-                        int n = llama_token_to_piece(vocab_, new_id, buf, sizeof(buf), 0, true);
-                        if (n > 0) {
-                            s.tx.insert(s.tx.end(), (uint8_t*)buf, (uint8_t*)buf + n);
+                        {
+                            std::string piece = uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
+                            if (!piece.empty()) {
+                                s.tx.insert(s.tx.end(), piece.begin(), piece.end());
+                            }
                         }
                         s.generated_count++;
                         s.pending_tok = new_id;
