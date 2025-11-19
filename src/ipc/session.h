@@ -20,6 +20,12 @@ enum class SessionState {
     ERRORED,
 };
 
+struct UmaSlo {
+    uint32_t target_ttft_ms = 150; // time-to-first-token target
+    uint32_t target_tbt_ms  = 80;  // target inter-token budget
+    uint8_t  priority       = 5;   // reserved for future QoS
+};
+
 struct ClientSession {
     int fd = -1;
     std::vector<uint8_t> rx;
@@ -37,6 +43,12 @@ struct ClientSession {
     bool wants_stream = true;
     bool read_closed = false;           // peer sent EOF on read side
     std::string last_error;
+
+    // SLO & timing fields
+    UmaSlo slo{};
+    uint64_t req_start_ns = 0;   // set when prompt parsed (not including prompt echo)
+    uint64_t first_emit_ns = 0;  // set on first generated piece
+    uint64_t last_emit_ns = 0;   // updated on every generated piece
 };
 
 using SessionPool = std::unordered_map<int, std::unique_ptr<ClientSession>>;

@@ -145,6 +145,9 @@ SessionManager::ReadResult SessionManager::on_readable(int fd, const uma::runtim
         s.prefill_idx = 0;
         s.generated_count = 0;
         s.has_pending_tok = false;
+        s.req_start_ns = now_ns;    // start timing for SLO
+        s.first_emit_ns = 0;
+        s.last_emit_ns = 0;
         if (s.seq < 0) s.seq = next_seq_id_++;
         s.state = SessionState::PREFILL;
         UMA_LOG_DEBUG() << "[prompt] fd=" << fd << " seq=" << s.seq

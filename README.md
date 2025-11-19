@@ -6,7 +6,7 @@ UMA Serve is a lightweight runtime daemon (umad) built on top of llama.cpp that:
 - Streams tokens as raw bytes with a simple, newline‑delimited protocol.
 - Uses a capacity‑aware, fairness‑oriented scheduler to batch work across sessions.
 
-Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire protocol is intentionally minimal for now; metrics and a framed JSON protocol land next.
+Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire protocol is intentionally minimal for now; metrics and a framed JSON protocol land next. The scheduler now tracks simple per‑session SLO timing (TTFT/TBT) and applies a latency guard that can skip PREFILL within a tick to protect interactive latency.
 
 **Quick Start**
 - Build: `./build.sh`
@@ -32,6 +32,7 @@ Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire
   - Socket path: `/tmp/uma.sock`
   - Socket mode: `0600`
   - Context tokens: `--n-ctx 4096` (change via flag or `UMA_N_CTX`)
+  - SLO defaults: TTFT target 150 ms, inter‑token target 80 ms (not yet user‑configurable)
 
 **Protocol (temporary, W1/W2)**
 - Each connection is a session. Send a single line terminated by `\n`.
@@ -45,6 +46,7 @@ Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire
 **Admin/Debug**
 - Set `UMA_DEBUG=1` for verbose daemon traces (batch composition, samples, I/O). The test harness captures these in `build/umad_test.log`.
 - Basic metrics (temporary) are available by sending `/metrics\n` on the UDS; the server replies with a single JSON line with fields like `tokens_generated_total`, `last_batch_size`, and `decode_ms_ewma`.
+- When the latency guard triggers, a debug log is emitted: `[guard] skipping PREFILL due to SLO(ttft|tbt)`.
 
 **Key Flags and Env Vars**
 - Required:
@@ -66,7 +68,11 @@ Note: some flags are experimental and may be ignored in early phases as the sche
 - Scheduler tick per loop iteration:
   - 1 token per DECODE session (keeps streams moving), then drain PREFILL in large chunks up to a device‑capacity budget.
   - Single `llama_decode` per tick with correct logits‑row mapping.
-  - Simple latency guard and adaptive batch target to stabilize per‑tick decode time.
+  - SLO‑aware latency guard (TTFT/TBT) may skip PREFILL for the tick; batch target adapts toward a ~30 ms decode budget.
+
+Refactor highlights (Phase B extraction):
+- I/O loop uses a `SessionManager` to own sessions and RX parsing (limits, UTF‑8/CR trim/NUL) and to transition to PREFILL. Main no longer performs parsing/tokenization.
+- Tokenization utilities are in `runtime/tokens.{h,cpp}` for consistent usage by I/O and scheduler.
 
 **Known Limitations (Phase 1)**
 - Newline protocol only; framed JSON and a CLI are upcoming.
@@ -88,3 +94,7 @@ Note: some flags are experimental and may be ignored in early phases as the sche
 - `/metrics` snapshot with decode/batch histograms and per‑session latency.
 - EVFILT_USER/eventfd wakeups and epoll backend; optional compute thread.
 - Prefix/KV cache; speculative decoding path for lower TTFT.
+
+**Testing Notes**
+- Run `scripts/tests/run_m1.py` and `scripts/tests/run_m3.py` with `UMA_MODEL` set for smoke coverage.
+- To observe the latency guard under mixed load, run with `UMA_DEBUG=1` and start a short and a long prompt concurrently; look for `[guard] skipping PREFILL…` in the log while short stays responsive.

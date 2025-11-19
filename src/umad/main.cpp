@@ -171,7 +171,6 @@ int main(int argc, char** argv) {
         uma::ipc::SessionManager sessions;
         llama_context* gctx = admin_ctx.get();
         const llama_vocab* vocab = llama_model_get_vocab(model.get());
-        // session seq ids are managed by SessionManager
 
         // Metrics (M4 stub)
         uma::metrics::Metrics mtx;
@@ -239,7 +238,8 @@ int main(int argc, char** argv) {
                     // client read via SessionManager
                     auto rr = sessions.on_readable(ev.fd, cfg, vocab, now_ns());
                     auto* sp = sessions.find(ev.fd);
-                    if (!sp) goto next_event;
+                    if (!sp)
+                        goto next_event;
                     auto& s = *sp;
                     if (rr.admin_request) {
                         std::string js = mtx.to_json((uint32_t)sessions.map().size());
@@ -255,7 +255,8 @@ int main(int argc, char** argv) {
                         poller.remove(ev.fd, uma::ipc::PollFlags::Read);
                     }
                     if (rr.wants_write && !s.tx.empty()) {
-                        // Try an immediate non-blocking drain; then arm write notifications if needed.
+                        // Try an immediate non-blocking drain; then arm write notifications if
+                        // needed.
                         ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
                         if (w > 0) {
                             UMA_LOG_DEBUG() << "[write-now] fd=" << ev.fd << " wrote(rx)=" << w;
@@ -299,6 +300,9 @@ int main(int argc, char** argv) {
                                 s.prefill_idx = 0;
                                 s.generated_count = 0;
                                 s.has_pending_tok = false;
+                                s.req_start_ns = 0;
+                                s.first_emit_ns = 0;
+                                s.last_emit_ns = 0;
                             }
                         }
                     }
