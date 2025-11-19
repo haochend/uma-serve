@@ -30,6 +30,8 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
     if (auto* sp = get_env("UMA_SOCK"))   cfg.socket_path = sp;
     if (auto* v = get_env("UMA_USE_MMAP"))  cfg.use_mmap  = parse_bool_flag(v);
     if (auto* v = get_env("UMA_USE_MLOCK")) cfg.use_mlock = parse_bool_flag(v);
+    if (auto* v = get_env("UMA_SLO_TTFT_MS")) cfg.slo_ttft_ms = (uint32_t) std::strtoul(v, nullptr, 10);
+    if (auto* v = get_env("UMA_SLO_TBT_MS"))  cfg.slo_tbt_ms  = (uint32_t) std::strtoul(v, nullptr, 10);
 
     // simple argv parser
     for (int i = 1; i < argc; ++i) {
@@ -77,6 +79,10 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
             cfg.idle_timeout_sec = static_cast<uint32_t>(std::strtoul(need("--idle-timeout-sec"), nullptr, 10));
         } else if (arg == "--max-merge") {
             cfg.max_merge = static_cast<uint32_t>(std::strtoul(need("--max-merge"), nullptr, 10));
+        } else if (arg == "--slo-ttft-ms") {
+            cfg.slo_ttft_ms = static_cast<uint32_t>(std::strtoul(need("--slo-ttft-ms"), nullptr, 10));
+        } else if (arg == "--slo-tbt-ms") {
+            cfg.slo_tbt_ms = static_cast<uint32_t>(std::strtoul(need("--slo-tbt-ms"), nullptr, 10));
         } else if (arg == "--help" || arg == "-h") {
             throw std::invalid_argument("help");
         }

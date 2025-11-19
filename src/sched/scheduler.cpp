@@ -2,7 +2,6 @@
 #include "ipc/session.h"
 #include "llama.h"
 #include "runtime/tokens.h"
-#include "util/logging.h"
 
 #include <algorithm>
 #include <atomic>
@@ -63,37 +62,6 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
     int32_t budget = std::min<int32_t>(target_batch_, batch_cap_);
     assert(budget > 0 && "batch budget must be > 0");
 
-    // SLO-aware latency guard: if any session has exceeded TTFT/TBT deadline, skip PREFILL
-    bool skip_prefill_due_to_latency = false;
-    const char* guard_reason = nullptr;
-    for (auto& kv : sessions) {
-        auto& s = *kv.second;
-        // Consider active sessions only
-        if (s.state != ipc::SessionState::DECODE && s.state != ipc::SessionState::PREFILL)
-            continue;
-        if (s.first_emit_ns == 0) {
-            if (s.req_start_ns != 0) {
-                uint64_t elapsed_ns = now_ns - s.req_start_ns;
-                if (elapsed_ns > (uint64_t)s.slo.target_ttft_ms * 1000ull * 1000ull) {
-                    skip_prefill_due_to_latency = true;
-                    guard_reason = "ttft";
-                    break;
-                }
-            }
-        } else {
-            uint64_t elapsed_ns = now_ns - s.last_emit_ns;
-            if (elapsed_ns > (uint64_t)s.slo.target_tbt_ms * 1000ull * 1000ull) {
-                skip_prefill_due_to_latency = true;
-                guard_reason = "tbt";
-                break;
-            }
-        }
-    }
-
-    if (skip_prefill_due_to_latency) {
-        UMA_LOG_DEBUG() << "[guard] skipping PREFILL due to SLO(" << guard_reason << ")";
-    }
-
     // handling Decode: give exactly 1 token to each ready DECODE session (round-robin), up to
     // budget
     if (!decode_pool.empty() && budget > 0) {
@@ -120,7 +88,7 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
 
     // handling Prefill: drain large chunks up to remaining budget (round-robin over prefill
     // sessions)
-    if (!prefill_pool.empty() && budget > 0 && !skip_prefill_due_to_latency) {
+    if (!prefill_pool.empty() && budget > 0) {
         for (size_t i = 0; i < prefill_pool.size() && budget > 0; ++i) {
             int curr_fd = prefill_pool[(rr_prefill_idx_ + i) % prefill_pool.size()];
             auto it = sessions.find(curr_fd);

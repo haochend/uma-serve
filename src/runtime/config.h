@@ -27,6 +27,10 @@ struct RuntimeConfig {
     // Scheduling (M3)
     uint32_t max_merge = 4;           // max sessions to merge per tick
 
+    // SLO instrumentation (for future policy)
+    uint32_t slo_ttft_ms = 150;       // target TTFT in ms (unused by executor)
+    uint32_t slo_tbt_ms  = 80;        // target inter-token budget in ms (unused by executor)
+
     // llama.cpp model params
     bool use_mmap  = true;
     bool use_mlock = false;

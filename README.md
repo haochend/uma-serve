@@ -6,13 +6,14 @@ UMA Serve is a lightweight runtime daemon (umad) built on top of llama.cpp that:
 - Streams tokens as raw bytes with a simple, newline‑delimited protocol.
 - Uses a capacity‑aware, fairness‑oriented scheduler to batch work across sessions.
 
-Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire protocol is intentionally minimal for now; metrics and a framed JSON protocol land next. The scheduler now tracks simple per‑session SLO timing (TTFT/TBT) and applies a latency guard that can skip PREFILL within a tick to protect interactive latency.
+Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire protocol is intentionally minimal for now; metrics and a framed JSON protocol land next. The runtime tracks simple per‑session SLO timing (TTFT/TBT) for observability and future policy work.
 
 **Quick Start**
 - Build: `./build.sh`
 - Run tests (smoke):
   - `UMA_MODEL=/path/to/model.gguf python3 scripts/tests/run_m1.py`
   - `UMA_MODEL=/path/to/model.gguf python3 scripts/tests/run_m3.py`
+  
 - Manual run:
   - Start: `build/umad --model /path/to/model.gguf`
   - Connect: `nc -U /tmp/uma.sock`, type a prompt, then press Enter
@@ -32,7 +33,7 @@ Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire
   - Socket path: `/tmp/uma.sock`
   - Socket mode: `0600`
   - Context tokens: `--n-ctx 4096` (change via flag or `UMA_N_CTX`)
-  - SLO defaults: TTFT target 150 ms, inter‑token target 80 ms (not yet user‑configurable)
+  - SLO defaults: TTFT target 150 ms, inter‑token target 80 ms (configurable)
 
 **Protocol (temporary, W1/W2)**
 - Each connection is a session. Send a single line terminated by `\n`.
@@ -46,7 +47,7 @@ Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire
 **Admin/Debug**
 - Set `UMA_DEBUG=1` for verbose daemon traces (batch composition, samples, I/O). The test harness captures these in `build/umad_test.log`.
 - Basic metrics (temporary) are available by sending `/metrics\n` on the UDS; the server replies with a single JSON line with fields like `tokens_generated_total`, `last_batch_size`, and `decode_ms_ewma`.
-- When the latency guard triggers, a debug log is emitted: `[guard] skipping PREFILL due to SLO(ttft|tbt)`.
+  
 
 **Key Flags and Env Vars**
 - Required:
@@ -57,6 +58,7 @@ Status: Phase 1 foundations are in place (M1/M2 done, M3 scheduler v1). The wire
   - `--socket /tmp/uma.sock` (or `UMA_SOCK`)
   - `--mlock` / `--no-mlock`, `--mmap` / `--no-mmap`
   - `--max-sessions`, `--max-prompt-bytes`, `--max-tokens`, `--idle-timeout-sec`
+  - `--slo-ttft-ms 150`, `--slo-tbt-ms 80` (or env: `UMA_SLO_TTFT_MS`, `UMA_SLO_TBT_MS`)
   - `UMA_DEBUG=1` for verbose logs
 
 Note: some flags are experimental and may be ignored in early phases as the scheduler evolves.
@@ -68,7 +70,7 @@ Note: some flags are experimental and may be ignored in early phases as the sche
 - Scheduler tick per loop iteration:
   - 1 token per DECODE session (keeps streams moving), then drain PREFILL in large chunks up to a device‑capacity budget.
   - Single `llama_decode` per tick with correct logits‑row mapping.
-  - SLO‑aware latency guard (TTFT/TBT) may skip PREFILL for the tick; batch target adapts toward a ~30 ms decode budget.
+  - Batch target adapts toward a ~30 ms decode budget. SLO‑aware policy will be added in a future refactor.
 
 Refactor highlights (Phase B extraction):
 - I/O loop uses a `SessionManager` to own sessions and RX parsing (limits, UTF‑8/CR trim/NUL) and to transition to PREFILL. Main no longer performs parsing/tokenization.
@@ -97,4 +99,3 @@ Refactor highlights (Phase B extraction):
 
 **Testing Notes**
 - Run `scripts/tests/run_m1.py` and `scripts/tests/run_m3.py` with `UMA_MODEL` set for smoke coverage.
-- To observe the latency guard under mixed load, run with `UMA_DEBUG=1` and start a short and a long prompt concurrently; look for `[guard] skipping PREFILL…` in the log while short stays responsive.

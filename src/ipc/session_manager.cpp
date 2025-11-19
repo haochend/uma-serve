@@ -148,6 +148,9 @@ SessionManager::ReadResult SessionManager::on_readable(int fd, const uma::runtim
         s.req_start_ns = now_ns;    // start timing for SLO
         s.first_emit_ns = 0;
         s.last_emit_ns = 0;
+        // apply SLO config
+        s.slo.target_ttft_ms = cfg.slo_ttft_ms;
+        s.slo.target_tbt_ms = cfg.slo_tbt_ms;
         if (s.seq < 0) s.seq = next_seq_id_++;
         s.state = SessionState::PREFILL;
         UMA_LOG_DEBUG() << "[prompt] fd=" << fd << " seq=" << s.seq

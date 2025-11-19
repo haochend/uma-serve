@@ -383,6 +383,44 @@ metrics:
 - Framed JSON protocol over UDS (request + streamed events) with partial I/O + backpressure.
 - Per-session latency EWMA and interactivity-aware batching (deadline-based preemption at token boundaries).
 
+---
+
+## Policy Separation & Latency Guard (Plan)
+
+Motivation: Keep the scheduler as an executor and move all heuristics into a policy layer that is easy to test and evolve (M4+).
+
+Targets
+- Define a minimal planning contract:
+  - `SchedulerState` (immutable snapshot of sessions, device, now_ns)
+  - `Plan` (vector of `BatchItem { seq_id, phase(PREFILL|DECODE), logits_flag }`)
+  - `IBatchPolicy::schedule_tick(state, constraints) -> Plan`
+- Extract current merge logic into `BaselinePolicy` (decode-first + prefill chunking + TTFT-first ordering).
+- Introduce a `LatencyGuardTransformer` that rewrites the prefill portion of the Plan to protect SLOs without starving progress.
+
+Guard redesign (replace naive guard)
+- Slack-based detection per session:
+  - TTFT slack = `slo.ttft_ms - (now - req_start_ns)` if `first_emit_ns==0`
+  - TBT slack  = `slo.tbt_ms  - (now - last_emit_ns)` if `first_emit_ns>0`
+- If any slack < 0, guard is active for the tick.
+- When active, prefill allowance becomes `allow = max(min_prefill_guard, floor(alpha * base_allow))` where
+  - `base_allow = max(0, target_batch - decode_count)`
+  - defaults: `alpha=0.2`, `min_prefill_guard=4`, `per_session_burst=16`, `hysteresis_ticks=2`.
+- Allocate allowance to TTFT-waiting sessions first (oldest by `req_start_ns`), in per-session bursts; do not drip 1 token.
+- Optional: cap allowance using ms-per-token EWMA to stay near a `tick_budget_ms` constraint.
+
+Metrics
+- Counters: `guard_ticks_total`, `slo_violations_ttft_total`, `slo_violations_tbt_total`.
+- Gauges: `budget_target`, `budget_used`, `ttft_waiting_sessions`, `last_batch_size`, `decode_ms_last`, `decode_ms_ewma`.
+
+Migration steps
+1) Add `Plan` and `IBatchPolicy` interfaces; move current logic into `BaselinePolicy` (no behavior change).
+2) Implement `LatencyGuardTransformer` and insert into the policy pipeline.
+3) Wire `Scheduler::tick()` to: snapshot state -> `policy_pipeline.schedule_tick()` -> execute Plan -> sample -> mutate sessions.
+4) Add counters/gauges; expose in `/metrics`.
+5) Later: introduce `PrefixCacheTransformer`, `PagedKvTransformer`, and `SpeculativeTransformer` as no-op shells first.
+
+Note: The naive guard in the scheduler is disabled by default (config `slo_guard_enabled=false`) and remains only for experimentation until the policy split lands.
+
 ## Positioning
 
 - UMA‑Serve: simplified, fairness‑oriented continuous batching on a single context; instructional baseline that now shows interleaving and adaptive batching.
