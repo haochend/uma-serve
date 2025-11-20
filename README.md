@@ -99,3 +99,4 @@ Refactor highlights (Phase B extraction):
 
 **Testing Notes**
 - Run `scripts/tests/run_m1.py` and `scripts/tests/run_m3.py` with `UMA_MODEL` set for smoke coverage.
+JSON protocol (M4): see `docs/PROTOCOL.md` for design. A `--protocol json|newline` flag will select the mode (default `json`).

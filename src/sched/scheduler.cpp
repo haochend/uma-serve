@@ -2,6 +2,7 @@
 #include "ipc/session.h"
 #include "llama.h"
 #include "runtime/tokens.h"
+#include "ipc/protocol.h"
 
 #include <algorithm>
 #include <atomic>
@@ -86,36 +87,52 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
         rr_decode_idx_ = (rr_decode_idx_ + 1) % decode_pool.size();
     }
 
-    // handling Prefill: drain large chunks up to remaining budget (round-robin over prefill
-    // sessions)
+    // handling Prefill: drain large chunks up to remaining budget.
+    // Prioritize sessions that haven't emitted their first token (TTFT-first), then others.
     if (!prefill_pool.empty() && budget > 0) {
-        for (size_t i = 0; i < prefill_pool.size() && budget > 0; ++i) {
+        std::vector<int> ttft_pool;
+        std::vector<int> rest_pool;
+        ttft_pool.reserve(prefill_pool.size());
+        rest_pool.reserve(prefill_pool.size());
+        for (size_t i = 0; i < prefill_pool.size(); ++i) {
             int curr_fd = prefill_pool[(rr_prefill_idx_ + i) % prefill_pool.size()];
             auto it = sessions.find(curr_fd);
-            if (it == sessions.end()) {
-                continue;
-            }
+            if (it == sessions.end()) continue;
             auto& s = *it->second;
-            size_t remain_sz = s.prompt_tokens.size() - s.prefill_idx;
-            int32_t remain =
-                    static_cast<int32_t>(std::min(remain_sz, static_cast<size_t>(INT32_MAX)));
-            int32_t chunk = std::min<int32_t>(remain, budget);
-            assert(chunk >= 0 && "prefill chunk size is less than 0");
-            for (size_t j = 0; j < chunk; ++j) {
-                llama_token t = static_cast<llama_token>(s.prompt_tokens[s.prefill_idx++]);
-                tokens.push_back(t);
-                n_seq_id.push_back(1);
-                seq_id_vals.push_back(s.seq);
-                seq_ids.push_back(&seq_id_vals.back());
-                int8_t lg = (j == chunk - 1) ? 1 : 0;
-                logits.push_back(lg);
-                if (lg) {
-                    samples.push_back(
-                            {s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::PREFILL});
-                }
-            }
-            budget -= chunk;
+            if (s.first_emit_ns == 0) ttft_pool.push_back(curr_fd); else rest_pool.push_back(curr_fd);
         }
+        auto schedule_pool = [&](const std::vector<int>& pool) {
+            for (int curr_fd : pool) {
+                if (budget <= 0) break;
+                auto it = sessions.find(curr_fd);
+                if (it == sessions.end()) continue;
+                auto& s = *it->second;
+                size_t remain_sz = s.prompt_tokens.size() - s.prefill_idx;
+                int32_t remain = static_cast<int32_t>(std::min(remain_sz, static_cast<size_t>(INT32_MAX)));
+                int32_t chunk = std::min<int32_t>(remain, budget);
+                // Limit per-session burst for TTFT sessions to avoid starving others
+                if (s.first_emit_ns == 0) {
+                    const int32_t kBurst = 16;
+                    chunk = std::min<int32_t>(chunk, kBurst);
+                }
+                assert(chunk >= 0 && "prefill chunk size is less than 0");
+                for (int32_t j = 0; j < chunk; ++j) {
+                    llama_token t = static_cast<llama_token>(s.prompt_tokens[s.prefill_idx++]);
+                    tokens.push_back(t);
+                    n_seq_id.push_back(1);
+                    seq_id_vals.push_back(s.seq);
+                    seq_ids.push_back(&seq_id_vals.back());
+                    int8_t lg = (j == chunk - 1) ? 1 : 0;
+                    logits.push_back(lg);
+                    if (lg) {
+                        samples.push_back({s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::PREFILL});
+                    }
+                }
+                budget -= chunk;
+            }
+        };
+        schedule_pool(ttft_pool);
+        if (budget > 0) schedule_pool(rest_pool);
         rr_prefill_idx_ = (rr_prefill_idx_ + 1) % prefill_pool.size();
     }
 
@@ -174,8 +191,14 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                 auto& s = *it->second;
                 s.last_error = "decode error";
                 s.state = ipc::SessionState::ERRORED;
-                const std::string err_msg = "error: decode failed\n";
-                s.tx.insert(s.tx.end(), err_msg.begin(), err_msg.end());
+                if (s.proto == uma::ipc::ProtocolMode::JSON) {
+                    uma::ipc::protocol::append_error_event(s.tx, s.request_id, "E_RUNTIME_DECODE",
+                                                          "decode failed");
+                    s.read_closed = true;
+                } else {
+                    const std::string err_msg = "error: decode failed\n";
+                    s.tx.insert(s.tx.end(), err_msg.begin(), err_msg.end());
+                }
             }
         } else {
             const int32_t n_vocab = llama_vocab_n_tokens(vocab_);
@@ -207,10 +230,13 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                     s.has_pending_tok = true;
                     s.state = ipc::SessionState::DECODE;
                     {
-                        std::string piece =
-                                uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
+                        std::string piece = uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
                         if (!piece.empty()) {
-                            s.tx.insert(s.tx.end(), piece.begin(), piece.end());
+                            if (s.proto == uma::ipc::ProtocolMode::JSON) {
+                                uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece, (int)new_id);
+                            } else {
+                                s.tx.insert(s.tx.end(), piece.begin(), piece.end());
+                            }
                         }
                     }
                     if (s.first_emit_ns == 0)
@@ -221,7 +247,13 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                 } else {
                     if (llama_vocab_is_eog(vocab_, new_id) ||
                         s.generated_count >= config_.max_tokens) {
-                        s.tx.push_back('\n');
+                        if (s.proto == uma::ipc::ProtocolMode::JSON) {
+                            uma::ipc::protocol::append_eos_event(
+                                    s.tx, s.request_id,
+                                    s.generated_count >= config_.max_tokens ? "length" : "stop");
+                        } else {
+                            s.tx.push_back('\n');
+                        }
                         s.state = ipc::SessionState::STREAM;
                         llama_memory_seq_rm(llama_get_memory(ctx_), s.seq, -1, -1);
                         // Update last emit on EOS newline
@@ -230,10 +262,13 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                         s.last_emit_ns = now_ns;
                     } else {
                         {
-                            std::string piece =
-                                    uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
+                            std::string piece = uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
                             if (!piece.empty()) {
-                                s.tx.insert(s.tx.end(), piece.begin(), piece.end());
+                                if (s.proto == uma::ipc::ProtocolMode::JSON) {
+                                    uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece, (int)new_id);
+                                } else {
+                                    s.tx.insert(s.tx.end(), piece.begin(), piece.end());
+                                }
                             }
                         }
                         s.generated_count++;

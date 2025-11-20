@@ -6,6 +6,10 @@ set(CMAKE_CXX_STANDARD 17)
 # Enable the compile‑commands export
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Enable CTest at the top-level so `ctest` discovers tests
+include(CTest)
+enable_testing()
+
 # --- 2. Configure llama.cpp (The "Engine") ---
 # Set llama.cpp's build options BEFORE adding it.
 set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
@@ -16,6 +20,8 @@ set(LLAMA_BUILD_EXAMPLES OFF CACHE INTERNAL "")
 # --- 3. Add the llama.cpp Submodule ---
 # This pulls in the llama.cpp project and defines its targets
 add_subdirectory(external/llama.cpp)
+add_subdirectory(external/googletest)
+include(GoogleTest)
 
 # --- 4. Define YOUR Executable (umad) ---
 add_executable(umad
@@ -26,6 +32,7 @@ add_executable(umad
     src/sched/scheduler.cpp
     src/metrics/metrics.cpp
     src/ipc/uds_server.cpp
+    src/ipc/protocol.cpp
     src/ipc/session_manager.cpp
 )
 
@@ -49,3 +56,13 @@ target_link_libraries(umad PRIVATE llama)
 
 # Make internal headers importable as "runtime/..."
 target_include_directories(umad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# --- 6. Define Unit Tests ---
+add_executable(uma_unit_tests
+    tests/cpp/test_main.cpp
+    tests/cpp/ipc_protocol_test.cpp
+    src/ipc/protocol.cpp
+)
+target_link_libraries(uma_unit_tests PRIVATE gtest_main)
+target_include_directories(uma_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+gtest_discover_tests(uma_unit_tests)

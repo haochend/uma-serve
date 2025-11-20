@@ -10,6 +10,7 @@
 #include "runtime/tokens.h"
 #include "sched/scheduler.h"
 #include "util/logging.h"
+#include "ipc/protocol.h"
 #include "util/utf8.h"
 
 #include "llama.h"
@@ -243,8 +244,14 @@ int main(int argc, char** argv) {
                     auto& s = *sp;
                     if (rr.admin_request) {
                         std::string js = mtx.to_json((uint32_t)sessions.map().size());
-                        s.tx.insert(s.tx.end(), js.begin(), js.end());
-                        s.tx.push_back('\n');
+                        if (s.proto == uma::ipc::ProtocolMode::JSON) {
+                            // Wrap metrics in an event
+                            std::string payload = std::string("{\"event\":\"metrics\",\"metrics\":") + js + "}";
+                            uma::ipc::protocol::write_frame(s.tx, payload);
+                        } else {
+                            s.tx.insert(s.tx.end(), js.begin(), js.end());
+                            s.tx.push_back('\n');
+                        }
                         // One-shot admin response: close after flushing
                         s.state = uma::ipc::SessionState::STREAM;
                         s.read_closed = true;
@@ -254,16 +261,39 @@ int main(int argc, char** argv) {
                     if (rr.removed_read) {
                         poller.remove(ev.fd, uma::ipc::PollFlags::Read);
                     }
-                    if (rr.wants_write && !s.tx.empty()) {
-                        // Try an immediate non-blocking drain; then arm write notifications if
-                        // needed.
-                        ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
-                        if (w > 0) {
-                            UMA_LOG_DEBUG() << "[write-now] fd=" << ev.fd << " wrote(rx)=" << w;
-                            s.tx.erase(s.tx.begin(), s.tx.begin() + w);
+                    if (rr.wants_write) {
+                        if (!s.tx.empty()) {
+                            // Try an immediate non-blocking drain; then arm write notifications if
+                            // needed.
+                            ssize_t w = ::write(ev.fd, s.tx.data(), s.tx.size());
+                            if (w > 0) {
+                                UMA_LOG_DEBUG() << "[write-now] fd=" << ev.fd << " wrote(rx)=" << w;
+                                s.tx.erase(s.tx.begin(), s.tx.begin() + w);
+                            }
                         }
-                        if (!s.tx.empty())
+                        if (!s.tx.empty()) {
                             poller.add(ev.fd, uma::ipc::PollFlags::Write);
+                        } else {
+                            // If we finished writing immediately, finalize response handling now
+                            if (s.state == uma::ipc::SessionState::ERRORED) {
+                                sessions.close(ev.fd, poller, gctx);
+                            } else if (s.state == uma::ipc::SessionState::STREAM) {
+                                if (s.read_closed) {
+                                    sessions.close(ev.fd, poller, gctx);
+                                } else {
+                                    s.state = uma::ipc::SessionState::RECV_REQ;
+                                    s.prompt_tokens.clear();
+                                    s.prefill_idx = 0;
+                                    s.generated_count = 0;
+                                    s.has_pending_tok = false;
+                                    s.req_start_ns = 0;
+                                    s.first_emit_ns = 0;
+                                    s.last_emit_ns = 0;
+                                    // Ensure we are monitoring reads again
+                                    poller.add(ev.fd, uma::ipc::PollFlags::Read);
+                                }
+                            }
+                        }
                     }
                 } else if (ev.writable()) {
                     // client write
