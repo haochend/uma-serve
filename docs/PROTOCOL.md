@@ -13,7 +13,7 @@ Scope: single‑process UDS transport. HTTP/SSE may reuse the same JSON event sc
 - Robust framing: length‑prefix prevents ambiguities, supports NULs, and handles partial I/O cleanly.
 - Structured requests: carry generation params, SLO hints, and metadata safely.
 - Streamed events: typed token/eos/error events simplify clients and tests.
-- Compatibility: keep newline mode behind a flag for quick debugging.
+- Compatibility: keep legacy newline mode for quick debugging (auto‑detected per connection).
 
 ---
 
@@ -63,10 +63,10 @@ All responses are frames carrying a JSON object with an `event` field.
   - `{ "id": "...", "event": "error", "code": "E_...", "message": "..." }`
 
 Admin metrics (one frame):
-- `{ "event": "metrics", ... snapshot fields ... }`
+- `{ "event": "metrics", "metrics": { ... snapshot fields ... } }`
 
 Notes
-- The server closes the socket after sending `eos` or `error` unless the client explicitly keeps the session open (future multi‑request sessions). For Phase 1, one request per connection.
+- After a normal `eos`, the connection remains open and the session returns to `RECV_REQ` (multiple requests per connection are supported). After an `error`, the server closes the connection.
 
 ---
 
@@ -101,20 +101,19 @@ On error: enqueue error event, flush, then close.
 
 ## Compatibility & Versioning
 
-- Mode flag: `--protocol json|newline` (default `json`).
-- JSON v1 schema is stable for Phase 1; future fields are optional and ignored by server until implemented.
-- CLI uses the same frames over UDS.
+- Per‑connection auto‑detect between JSON (default) and legacy newline.
+- JSON v1 schema is stable; future fields are optional and ignored by the server until implemented.
+- CLI will use the same frames over UDS.
 
 ---
 
 ## Implementation Plan
 
-1) Add protocol flag and caps in `RuntimeConfig`.
-2) Implement codec `ipc/protocol.{h,cpp}` with `read_frame()` and `write_frame()` and caps.
-3) Extend `SessionManager::on_readable()` to branch by protocol; parse request frames, validate, tokenize, transition to PREFILL.
-4) Stream events as frames in JSON mode; keep newline mode as is.
-5) Add `uma-cli` to exercise happy path and partial I/O scenarios.
-6) Tests: partial frames, oversize frame rejection, invalid JSON, busy request, and admin metrics.
+1) Implement codec `ipc/protocol.{h,cpp}` with `read_frame()` and `write_frame()` and caps.
+2) Extend `SessionManager::on_readable()` to auto‑detect protocol; parse request frames, validate, tokenize, transition to PREFILL.
+3) Stream events as frames in JSON mode; keep newline mode as is.
+4) Add `uma-cli` to exercise happy path and partial I/O scenarios.
+5) Tests: partial frames, oversize frame rejection, invalid JSON, busy request, and admin metrics.
 
 ---
 
@@ -125,4 +124,3 @@ On error: enqueue error event, flush, then close.
 - Echoing `metadata` in events? (later)
 
 ---
-
