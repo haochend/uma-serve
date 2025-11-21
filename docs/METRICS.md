@@ -24,8 +24,21 @@ The current implementation provides a minimal set of core metrics to gauge the b
 | `tokens_generated_total` | Counter | A monotonically increasing count of all tokens generated since the daemon started.                        |
 | `batch_calls_total`      | Counter | A monotonically increasing count of `llama_decode` calls. This corresponds to the number of scheduler ticks that resulted in a batch. |
 | `last_batch_size`        | Gauge   | The number of tokens in the most recently processed batch.                                                |
-| `decode_ms_last`         | Gauge   | The wall-clock time in milliseconds that the most recent `llama_decode` call took to execute.             |
+| `decode_ms_last`         | Gauge   | Generation-only: ms attributed to the DECODE portion of the most recent `llama_decode` call.             |
 | `decode_ms_ewma`         | Gauge   | The Exponentially Weighted Moving Average (EWMA) of decode times. This value is used by the adaptive batching algorithm. |
+| `decode_calls`           | Counter | Number of decode measurements that included generation (DECODE) work.                                     |
+| `decode_ns_total`        | Counter | Sum of generation-attributed durations (ns).                                                              |
+| `decode_tokens_total`    | Counter | Total generation (DECODE phase) tokens across all measurements.                                           |
+| `decode_phase_tokens_total` | Counter | Alias of `decode_tokens_total` (generation tokens).                                                    |
+| `prefill_tokens_total`   | Counter | Total PREFILL tokens included across all measured decode batches.                                         |
+| `decode_ns_total_gen`    | Counter | Alias of `decode_ns_total` (generation-attributed durations).                                            |
+| `prefill_ns_total`       | Counter | Estimated time spent on prefill tokens (ns), proportionally attributed from batch durations.             |
+| `gen_ms_per_token_mean`  | Gauge   | Mean milliseconds per generation token (derived).                                                         |
+| `prefill_ms_per_token_mean` | Gauge | Mean milliseconds per prefill token (derived).                                                           |
+| `decode_ms_min`          | Gauge   | Minimum observed `llama_decode` duration (ms) since start.                                               |
+| `decode_ms_max`          | Gauge   | Maximum observed `llama_decode` duration (ms) since start.                                               |
+| `decode_ms_mean`         | Gauge   | Mean generation (DECODE) duration (ms), derived from totals.                                             |
+| `decode_tokens_per_call_mean` | Gauge | Mean generation tokens per measured call (tokens/call).                                              |
 | `active_sessions`        | Gauge   | The number of currently connected client sessions.                                                        |
 
 ### Example Output (newline)
@@ -37,6 +50,13 @@ The current implementation provides a minimal set of core metrics to gauge the b
   "last_batch_size": 32,
   "decode_ms_last": 28,
   "decode_ms_ewma": 31.458,
+  "decode_calls": 678,
+  "decode_ns_total": 19234000000,
+  "decode_tokens_total": 17500,
+  "decode_ms_min": 11,
+  "decode_ms_max": 44,
+  "decode_ms_mean": 28.376,
+  "decode_tokens_per_call_mean": 25.813,
   "active_sessions": 4
 }
 ```
@@ -52,6 +72,13 @@ The current implementation provides a minimal set of core metrics to gauge the b
     "last_batch_size": 32,
     "decode_ms_last": 28,
     "decode_ms_ewma": 31.458,
+    "decode_calls": 678,
+    "decode_ns_total": 19234000000,
+    "decode_tokens_total": 17500,
+    "decode_ms_min": 11,
+    "decode_ms_max": 44,
+    "decode_ms_mean": 28.376,
+    "decode_tokens_per_call_mean": 25.813,
     "active_sessions": 4
   }
 }

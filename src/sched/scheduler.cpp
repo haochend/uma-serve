@@ -65,6 +65,8 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
 
     // handling Decode: give exactly 1 token to each ready DECODE session (round-robin), up to
     // budget
+    int32_t decode_tok_count = 0;
+    int32_t prefill_tok_count = 0;
     if (!decode_pool.empty() && budget > 0) {
         for (size_t i = 0; i < decode_pool.size() && budget > 0; ++i) {
             int curr_fd = decode_pool[(rr_decode_idx_ + i) % decode_pool.size()];
@@ -83,6 +85,7 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
             logits.push_back(1);
             samples.push_back({s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::DECODE});
             budget--;
+            decode_tok_count += 1;
         }
         rr_decode_idx_ = (rr_decode_idx_ + 1) % decode_pool.size();
     }
@@ -127,6 +130,7 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                     if (lg) {
                         samples.push_back({s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::PREFILL});
                     }
+                    prefill_tok_count += 1;
                 }
                 budget -= chunk;
             }
@@ -162,15 +166,44 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
         // Ensure all queued backend work has finished so timing reflects real compute
         llama_synchronize(ctx_);
         auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+        auto dur_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        double ms = static_cast<double>(dur_ns) / 1.0e6;
 
         // update metrics (if provided)
         if (metrics_) {
             metrics_->batch_calls_total.fetch_add(1, std::memory_order_relaxed);
             metrics_->last_batch_size.store(static_cast<uint32_t>(tokens.size()),
                                             std::memory_order_relaxed);
-            metrics_->decode_ms_last.store(static_cast<uint32_t>(ms + 0.5),
-                                           std::memory_order_relaxed);
+
+            // Split accounting: attribute total time proportionally to token counts
+            const uint64_t tot_tok = static_cast<uint64_t>(tokens.size());
+            const uint64_t gen_tok = static_cast<uint64_t>(decode_tok_count);
+            const uint64_t pf_tok  = static_cast<uint64_t>(prefill_tok_count);
+            metrics_->decode_phase_tokens_total.fetch_add(gen_tok, std::memory_order_relaxed);
+            metrics_->prefill_tokens_total.fetch_add(pf_tok, std::memory_order_relaxed);
+
+            uint64_t gen_ns = 0;
+            uint64_t pf_ns  = 0;
+            if (tot_tok > 0) {
+                gen_ns = static_cast<uint64_t>((__int128)dur_ns * gen_tok / tot_tok);
+                pf_ns  = static_cast<uint64_t>(dur_ns) - gen_ns;
+            }
+            metrics_->decode_ns_total_gen.fetch_add(gen_ns, std::memory_order_relaxed);
+            metrics_->prefill_ns_total.fetch_add(pf_ns, std::memory_order_relaxed);
+
+            // Generation-only decode metrics: exclude PREFILL
+            if (gen_tok > 0) {
+                uint32_t gen_ms_u32 = static_cast<uint32_t>((gen_ns / 1000000.0) + 0.5);
+                metrics_->decode_ms_last.store(gen_ms_u32, std::memory_order_relaxed);
+                metrics_->decode_ns_total.fetch_add(gen_ns, std::memory_order_relaxed);
+                metrics_->decode_calls.fetch_add(1, std::memory_order_relaxed);
+                metrics_->decode_tokens_total.fetch_add(gen_tok, std::memory_order_relaxed);
+                // Min/max (single-threaded writer; relaxed is fine)
+                uint32_t cur_min = metrics_->decode_ms_min.load(std::memory_order_relaxed);
+                if (gen_ms_u32 < cur_min) metrics_->decode_ms_min.store(gen_ms_u32, std::memory_order_relaxed);
+                uint32_t cur_max = metrics_->decode_ms_max.load(std::memory_order_relaxed);
+                if (gen_ms_u32 > cur_max) metrics_->decode_ms_max.store(gen_ms_u32, std::memory_order_relaxed);
+            }
         }
         // EWMA toward observed decode time + publish
         decode_ms_ewma_ = 0.8 * decode_ms_ewma_ + 0.2 * ms;
