@@ -78,6 +78,11 @@ Run the client:
 python3 client.py
 ```
 
+Or use the built CLI:
+```sh
+./build/uma_cli --socket /tmp/uma.sock --prompt "Hello, UMA Serve!" --max-tokens 20
+```
+
 ## Testing
 
 The project uses `pytest` for end-to-end tests and GoogleTest for C++ unit tests.

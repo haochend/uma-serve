@@ -159,6 +159,8 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
 
         auto t0 = std::chrono::steady_clock::now();
         int dec_rc = llama_decode(ctx_, batch);
+        // Ensure all queued backend work has finished so timing reflects real compute
+        llama_synchronize(ctx_);
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
 

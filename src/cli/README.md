@@ -1,7 +1,7 @@
 # UMA-CLI
 
 **Component:** `src/cli`
-**Status:** Planned
+**Status:** Available (MVP)
 
 This directory is intended for the `uma-cli` executable, a command-line interface for interacting with the `umad` server. It serves as a reference client implementation and a useful tool for testing and scripting.
 
@@ -11,7 +11,7 @@ The `uma-cli` tool provides a user-friendly way to send prompts to the `umad` da
 
 ## Planned Usage
 
-The CLI will be invoked with flags to control the prompt, generation parameters, and server connection.
+The CLI is invoked with flags to control the prompt, generation parameters, and server connection.
 
 ```sh
 uma-cli [OPTIONS] --prompt "Your prompt text here"
@@ -27,7 +27,8 @@ uma-cli [OPTIONS] --prompt "Your prompt text here"
 | `--max-tokens <n>`    | int     | `2048`          | Maximum number of tokens to generate.                                     |
 | `--temp <float>`      | float   | `0.8`           | Generation temperature. `0.0` means greedy decoding.                      |
 | `--top-p <float>`     | float   | `0.95`          | Nucleus sampling (top-p) probability.                                     |
-| `--no-stream`         | bool    | `false`         | If set, buffer all `token` events and print the full response only at the end. |
+| `--no-stream`         | bool    | `false`         | If set, request non-streaming. Server may still stream in current MVP. |
+| `--metrics`           | bool    | `false`         | Request a one-shot metrics snapshot and print it as JSON. |
 
 ## Output Format
 
@@ -35,17 +36,9 @@ By default, `uma-cli` will stream the `text` field from each JSON `token` event 
 
 If a non-recoverable error occurs, a message will be printed to `stderr`.
 
-### Raw JSON Output
-
-A future version may include a `--json` flag to print the raw, framed JSON events, which is useful for scripting and debugging the protocol.
-
-**Example raw output:**
-```json
-{"id":"req-1","event":"token","text":"Hello","token_id":1234}
-{"id":"req-1","event":"token","text":",","token_id":567}
-{"id":"req-1","event":"token","text":" world","token_id":890}
-{"id":"req-1","event":"eos","reason":"stop"}
-```
+Notes
+- The client prints token text as it arrives and a newline on EOS. Errors are printed to stderr and return exit code 2.
+- `--metrics` prints a single JSON line (wrapped by the server) and exits.
 
 ## Exit Codes
 

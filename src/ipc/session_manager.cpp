@@ -96,17 +96,7 @@ SessionManager::ReadResult SessionManager::on_readable(int fd, const uma::runtim
             }
             return rr; // need more
         }
-        // Admin metrics (JSON): look for {"type":"metrics"} or {"event":"metrics"}
-        if (js.find("\"type\"\s*:\s*\"metrics\"") != std::string::npos ||
-            js.find("\"event\"\s*:\s*\"metrics\"") != std::string::npos ||
-            js.find("\"metrics\"") == 2) {
-            rr.admin_request = true;
-            s.state = SessionState::STREAM;
-            s.read_closed = true;
-            rr.wants_write = true;
-            rr.removed_read = true;
-            return rr;
-        }
+        // Admin metrics handled below
         // minimal field extraction with basic JSON string parsing (handles escapes; flags invalid escapes)
         auto extract_json_string = [](const std::string& j, const char* key,
                                       bool& invalid_escape) -> std::string {
@@ -163,6 +153,21 @@ SessionManager::ReadResult SessionManager::on_readable(int fd, const uma::runtim
             }
             return out;
         };
+
+        // Admin metrics (JSON): accept {"type":"metrics"} or {"event":"metrics"}
+        {
+            bool type_invalid = false, event_invalid = false;
+            std::string typ = extract_json_string(js, "type", type_invalid);
+            std::string evt = extract_json_string(js, "event", event_invalid);
+            if ((!type_invalid && typ == "metrics") || (!event_invalid && evt == "metrics")) {
+                rr.admin_request = true;
+                s.state = SessionState::STREAM;
+                s.read_closed = true;
+                rr.wants_write = true;
+                rr.removed_read = true;
+                return rr;
+            }
+        }
 
         bool id_invalid = false, prompt_invalid = false;
         std::string req_id = extract_json_string(js, "id", id_invalid);

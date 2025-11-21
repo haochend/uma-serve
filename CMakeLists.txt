@@ -57,7 +57,15 @@ target_link_libraries(umad PRIVATE llama)
 # Make internal headers importable as "runtime/..."
 target_include_directories(umad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# --- 6. Define Unit Tests ---
+# --- 6. CLI executable (uma-cli) ---
+add_executable(uma_cli
+    src/cli/main.cpp
+    src/ipc/protocol.cpp
+)
+target_link_libraries(uma_cli PRIVATE)
+target_include_directories(uma_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# --- 7. Define Unit Tests ---
 add_executable(uma_unit_tests
     tests/cpp/test_main.cpp
     tests/cpp/ipc_protocol_test.cpp
