@@ -31,7 +31,7 @@ The core of the IPC layer is a non-blocking, single-threaded event loop.
     - **Session Tracking:** Maintains a map of file descriptors to `ClientSession` objects.
     - **State Machine:** A `ClientSession` object holds the state of a single client (e.g., `RECV_REQ`, `PREFILL`, `DECODE`). The `session_manager` is responsible for transitioning the session between these states.
     - **RX Handling:** The `on_readable()` method is called by the main loop when a client socket has data to be read. It reads the data into a per-session receive buffer (`rx`).
-    - **Protocol Detection:** It contains the logic to automatically detect whether a client is using the legacy newline protocol or the modern framed JSON protocol based on the initial bytes received.
+    - **Protocol Parsing (JSON-only):** Parses a length-prefixed JSON frame from `rx`, validates it, tokenizes the prompt, and transitions the session to `PREFILL`.
 
 ### `protocol`
 
@@ -48,7 +48,7 @@ The core of the IPC layer is a non-blocking, single-threaded event loop.
 3.  A client connects. The `poller` reports a readable event on the listen socket. `uds_server` accepts the connection, and `session_manager` creates a new `ClientSession`.
 4.  The client sends a request. The `poller` reports a readable event on the client's socket.
 5.  The main loop calls `session_manager::on_readable()`.
-6.  `on_readable()` reads the data into the session's `rx` buffer and performs protocol detection.
-7.  It parses the request (either a newline-terminated string or a JSON frame).
+6.  `on_readable()` reads the data into the session's `rx` buffer.
+7.  It parses the request as a framed JSON object.
 8.  It tokenizes the prompt and transitions the session state to `PREFILL`.
 9.  The main loop then calls the `Scheduler`, which sees the session in the `PREFILL` state and begins processing it.

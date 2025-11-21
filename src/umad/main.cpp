@@ -11,7 +11,6 @@
 #include "sched/scheduler.h"
 #include "util/logging.h"
 #include "ipc/protocol.h"
-#include "util/utf8.h"
 
 #include "llama.h"
 
@@ -56,53 +55,6 @@ void print_usage() {
               << "Env: UMA_MODEL, UMA_N_CTX, UMA_THREADS, UMA_USE_MMAP, UMA_USE_MLOCK, UMA_SOCK\n";
 }
 
-// Validate basic UTF-8 correctness (reject overlong & invalid ranges)
-bool is_valid_utf8(const std::string& s) {
-    unsigned int remaining = 0;
-    unsigned char lead = 0;
-    unsigned int pos = 0;
-    for (unsigned char c : s) {
-        if (remaining == 0) {
-            if (c <= 0x7F) {
-                continue;
-            } else if (c >= 0xC2 && c <= 0xDF) {
-                remaining = 1;
-                lead = c;
-                pos = 0;
-            } else if (c >= 0xE0 && c <= 0xEF) {
-                remaining = 2;
-                lead = c;
-                pos = 0;
-            } else if (c >= 0xF0 && c <= 0xF4) {
-                remaining = 3;
-                lead = c;
-                pos = 0;
-            } else {
-                return false; // overlong leads C0/C1 or > F4
-            }
-        } else {
-            if ((c & 0xC0) != 0x80)
-                return false;
-            ++pos;
-            if (pos == 1) {
-                // first continuation has extra constraints for some leads
-                if (lead == 0xE0 && c < 0xA0)
-                    return false; // overlong 3-byte
-                if (lead == 0xED && c > 0x9F)
-                    return false; // UTF-16 surrogate
-                if (lead == 0xF0 && c < 0x90)
-                    return false; // overlong 4-byte
-                if (lead == 0xF4 && c > 0x8F)
-                    return false; // > U+10FFFF
-            }
-            if (--remaining == 0) {
-                lead = 0;
-                pos = 0;
-            }
-        }
-    }
-    return remaining == 0;
-}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -183,7 +135,8 @@ int main(int argc, char** argv) {
             return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
         };
 
-        UMA_LOG_INFO() << "Ready. Connect with: nc -U " << cfg.socket_path;
+        UMA_LOG_INFO() << "Ready. Use framed JSON over UDS at " << cfg.socket_path
+                       << " (see README client snippet or uma-cli).";
 
         // main event loop
         while (!g_shutdown.load(std::memory_order_relaxed)) {
@@ -244,14 +197,9 @@ int main(int argc, char** argv) {
                     auto& s = *sp;
                     if (rr.admin_request) {
                         std::string js = mtx.to_json((uint32_t)sessions.map().size());
-                        if (s.proto == uma::ipc::ProtocolMode::JSON) {
-                            // Wrap metrics in an event
-                            std::string payload = std::string("{\"event\":\"metrics\",\"metrics\":") + js + "}";
-                            uma::ipc::protocol::write_frame(s.tx, payload);
-                        } else {
-                            s.tx.insert(s.tx.end(), js.begin(), js.end());
-                            s.tx.push_back('\n');
-                        }
+                        // Wrap metrics in an event
+                        std::string payload = std::string("{\"event\":\"metrics\",\"metrics\":") + js + "}";
+                        uma::ipc::protocol::write_frame(s.tx, payload);
                         // One-shot admin response: close after flushing
                         s.state = uma::ipc::SessionState::STREAM;
                         s.read_closed = true;

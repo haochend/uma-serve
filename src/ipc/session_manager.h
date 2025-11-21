@@ -38,8 +38,8 @@ class SessionManager {
         std::string admin_line;     // the raw line parsed
     };
 
-    // Handle readable event: read bytes, enforce limits/UTF-8, parse newline, tokenize prompt.
-    // On prompt, transitions session to PREFILL and echoes prompt pieces into tx.
+    // Handle readable event: read bytes, parse framed JSON, validate and tokenize prompt.
+    // On prompt, transitions session to PREFILL.
     // Returns what actions the caller should take.
     ReadResult on_readable(int fd, const uma::runtime::RuntimeConfig& cfg, const llama_vocab* vocab,
                            uint64_t now_ns);
@@ -50,4 +50,3 @@ class SessionManager {
 };
 
 } // namespace uma::ipc
-

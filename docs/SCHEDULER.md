@@ -56,9 +56,11 @@ This adaptive mechanism helps the server stay responsive under varying load and 
 
 ## Future Work & Extensibility
 
-The current scheduler provides a strong baseline. The following features are planned for future iterations, as outlined in the system design documents:
+The current scheduler provides a strong baseline. The following features are planned and tracked to evolve the policy and executor, as outlined in the system design documents:
 
-- **SLO-Aware Latency Guard:** A more explicit policy that will actively throttle or pause `PREFILL` work if the inter-token latency of any interactive `DECODE` session violates its configured Service-Level Objective (SLO).
-- **QoS and Priority Queues:** Using the `priority` field from the JSON protocol's `slo` object to sort sessions into different queues (e.g., `interactive`, `normal`, `background`). This will allow the scheduler to make more informed decisions about which sessions to prioritize during both `DECODE` and `PREFILL` phases.
-- **Token-based Preemption:** A mechanism to interrupt the processing of a low-priority prefill batch to immediately service a high-priority request, further minimizing TTFT for interactive sessions.
-- **ΣBMT Budgeting:** Integrating a cost model based on Bytes-Moved-per-Token to make scheduling decisions that are aware of UMA memory bandwidth saturation, not just compute capacity.
+- **Policy Separation:** Extract a standalone `IBatchPolicy` planner operating on `SchedulerState` to produce a `Plan`, executed by the scheduler.
+- **SLO-Aware Latency Guard:** Actively throttle or pause `PREFILL` when TTFT/TBT SLOs are at risk, with hysteresis.
+- **QoS and Priority Queues:** Use `priority`/classification to regulate budget across interactive/background work.
+- **Token-based Preemption:** Interrupt low-priority prefill at token boundaries to immediately serve higher-priority work.
+- **ΣBMT Budgeting:** Integrate a cost model based on Bytes-Moved-per-Token to manage UMA memory bandwidth pressure.
+- **Speculative Decoding:** Draft/verify decoding to reduce TTFT and improve single-stream latency when available.

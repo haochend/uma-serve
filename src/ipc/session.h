@@ -11,12 +11,6 @@ struct llama_context;
 
 namespace uma::ipc {
 
-enum class ProtocolMode : uint8_t {
-    AUTO = 0,
-    NEWLINE = 1,
-    JSON = 2,
-};
-
 enum class SessionState {
     RECV_REQ,
     PREFILL,
@@ -56,8 +50,7 @@ struct ClientSession {
     uint64_t first_emit_ns = 0;  // set on first generated piece
     uint64_t last_emit_ns = 0;   // updated on every generated piece
 
-    // Protocol (auto-detected per connection)
-    ProtocolMode proto = ProtocolMode::AUTO;
+    // Protocol: JSON-only (no mode field required)
     std::string request_id;       // for JSON mode events
 };
 

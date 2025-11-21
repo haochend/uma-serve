@@ -7,6 +7,7 @@ This document provides a high-level overview of the UMA Serve architecture. It i
 - **[SYSTEM_DESIGN.md](./SYSTEM_DESIGN.md) (This document):** A high-level overview of the components and their interactions.
 - **[PROTOCOL.md](./PROTOCOL.md):** A detailed specification of the framed JSON wire protocol.
 - **[SCHEDULER.md](./SCHEDULER.md):** A deep dive into the continuous batching and scheduling policy.
+- **[POLICY.md](./POLICY.md):** The scheduling policy as a standalone, pluggable component and its roadmap.
 - **[MEMORY.md](./MEMORY.md):** An explanation of the memory sharing and KV cache management strategy.
 - **[METRICS.md](./METRICS.md):** A guide to the observability metrics available from the server.
 - **[CONFIG.md](./CONFIG.md):** A complete reference for all configuration options.
@@ -25,7 +26,8 @@ The data flow is as follows:
 
 - **`runtime` (`src/runtime`):** A layer that wraps the `llama.cpp` backend, managing the model and context lifecycle via RAII and providing helper functions for tokenization.
 - **`ipc` (`src/ipc`):** The Inter-Process Communication layer. It manages the UDS server, the `kqueue`-based event loop (`poller`), session state, and the protocol parsing logic.
-- **`sched` (`src/sched`):** The core scheduler responsible for implementing the continuous batching policy. It decides which tokens from which sessions to include in the next batch.
+- **`sched` (`src/sched`):** The executor that drives continuous batching. It builds a batch per tick and executes `llama_decode`.
+- **Policy (planned as a separate layer):** A standalone planning component that takes a `SchedulerState` snapshot and produces a `Plan` for the scheduler to execute. This separation enables policy experimentation (e.g., SLO‑aware guard, QoS) without touching the executor.
 - **`metrics` (`src/metrics`):** A lightweight, thread-safe component for collecting and exposing performance and health metrics.
 - **`cli` (`src/cli`):** The planned command-line interface for interacting with the daemon.
 - **`umad` (`src/umad`):** The main entry point that initializes all components and runs the primary event loop.
@@ -46,7 +48,7 @@ A future version will evolve this into a multi-threaded model to separate I/O fr
 
 ## Scheduling & Batching
 
-The scheduler's goal is to maximize throughput while protecting the latency of interactive sessions. It does this via a two-phase, tick-based policy.
+The scheduler's goal is to maximize throughput while protecting the latency of interactive sessions. It does this via a two-phase, tick-based policy. A future version will extract the policy into a standalone component (see [POLICY.md](./POLICY.md)).
 
 1.  **Decode Phase:** All active sessions get one token processed to ensure forward progress.
 2.  **Prefill Phase:** The remaining batch capacity is used to ingest new prompts, prioritizing those that have not yet received a first token (TTFT-first).
@@ -70,10 +72,9 @@ Efficiency on UMA systems requires careful memory management. UMA Serve's strate
 
 ## Protocol
 
-Communication occurs over a Unix Domain Socket. The server can automatically detect the protocol per-session.
+Communication occurs over a Unix Domain Socket using a single, JSON‑only protocol.
 
-- **Framed JSON (Default):** The primary protocol is a simple, length‑prefixed JSON format. Requests are JSON objects containing a prompt and parameters, and the server replies with a stream of JSON `event` objects (`token`, `eos`, `error`). Multiple requests per connection are allowed; send the next request after `eos`.
-- **Newline (Legacy):** A simple newline‑terminated string protocol is also supported for basic clients like `nc`. Multiple prompts per connection are allowed.
+- **Framed JSON:** The wire format is length‑prefixed JSON. Requests are JSON objects containing a prompt and parameters, and the server replies with a stream of JSON `event` objects (`token`, `eos`, `error`). Multiple requests per connection are allowed; send the next request after `eos`.
 
 > For the complete wire format, JSON schemas, and event types, see **[PROTOCOL.md](./PROTOCOL.md)**.
 
@@ -85,3 +86,13 @@ Communication occurs over a Unix Domain Socket. The server can automatically det
 - **Configuration:** The daemon is configured via command-line flags and environment variables.
 
 > For a full list of available metrics and configuration options, see **[METRICS.md](./METRICS.md)** and **[CONFIG.md](./CONFIG.md)**.
+
+---
+
+## Roadmap Snapshot (North Star)
+
+- Policy separation: `SchedulerState` → `Plan` via `IBatchPolicy` with a transformer pipeline (LatencyGuard, Admission/QoS, PrefixCache, PagedKV, SpeculativeDecode), executed by a minimal scheduler.
+- Prefix (KV snapshot) cache to skip repeated prefill (TTFT wedge).
+- ΣBMT‑aware scheduling and paged KV to manage bandwidth on UMA.
+- Speculative decoding (draft/verify) to reduce TTFT in single‑stream scenarios.
+- Zero‑copy logits (when supported by backend) and sampler overlap.

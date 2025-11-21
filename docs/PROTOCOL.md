@@ -13,7 +13,7 @@ Scope: single‑process UDS transport. HTTP/SSE may reuse the same JSON event sc
 - Robust framing: length‑prefix prevents ambiguities, supports NULs, and handles partial I/O cleanly.
 - Structured requests: carry generation params, SLO hints, and metadata safely.
 - Streamed events: typed token/eos/error events simplify clients and tests.
-- Compatibility: keep legacy newline mode for quick debugging (auto‑detected per connection).
+- Compatibility: protocol is JSON‑only.
 
 ---
 
@@ -74,8 +74,7 @@ Notes
 
 `RECV_REQ → PREFILL → DECODE → STREAM → DONE|ERRORED`
 
-- JSON mode: `RECV_REQ` parses request frames (may buffer multiple) and rejects a second request while busy.
-- Newline mode: unchanged; kept behind `--protocol newline` for debug.
+- `RECV_REQ` parses request frames (may buffer multiple) and rejects a second request while busy.
 
 ---
 
@@ -101,19 +100,17 @@ On error: enqueue error event, flush, then close.
 
 ## Compatibility & Versioning
 
-- Per‑connection auto‑detect between JSON (default) and legacy newline.
 - JSON v1 schema is stable; future fields are optional and ignored by the server until implemented.
-- CLI will use the same frames over UDS.
+- CLI uses the same frames over UDS.
 
 ---
 
 ## Implementation Plan
 
 1) Implement codec `ipc/protocol.{h,cpp}` with `read_frame()` and `write_frame()` and caps.
-2) Extend `SessionManager::on_readable()` to auto‑detect protocol; parse request frames, validate, tokenize, transition to PREFILL.
-3) Stream events as frames in JSON mode; keep newline mode as is.
-4) Add `uma-cli` to exercise happy path and partial I/O scenarios.
-5) Tests: partial frames, oversize frame rejection, invalid JSON, busy request, and admin metrics.
+2) Extend `SessionManager::on_readable()` to parse request frames, validate, tokenize, transition to PREFILL.
+3) Add `uma-cli` to exercise happy path and partial I/O scenarios.
+4) Tests: partial frames, oversize frame rejection, invalid JSON, busy request, and admin metrics.
 
 ---
 

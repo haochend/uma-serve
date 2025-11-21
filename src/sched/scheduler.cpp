@@ -191,14 +191,9 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                 auto& s = *it->second;
                 s.last_error = "decode error";
                 s.state = ipc::SessionState::ERRORED;
-                if (s.proto == uma::ipc::ProtocolMode::JSON) {
-                    uma::ipc::protocol::append_error_event(s.tx, s.request_id, "E_RUNTIME_DECODE",
-                                                          "decode failed");
-                    s.read_closed = true;
-                } else {
-                    const std::string err_msg = "error: decode failed\n";
-                    s.tx.insert(s.tx.end(), err_msg.begin(), err_msg.end());
-                }
+                uma::ipc::protocol::append_error_event(s.tx, s.request_id, "E_RUNTIME_DECODE",
+                                                      "decode failed");
+                s.read_closed = true;
             }
         } else {
             const int32_t n_vocab = llama_vocab_n_tokens(vocab_);
@@ -232,11 +227,7 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                     {
                         std::string piece = uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
                         if (!piece.empty()) {
-                            if (s.proto == uma::ipc::ProtocolMode::JSON) {
-                                uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece, (int)new_id);
-                            } else {
-                                s.tx.insert(s.tx.end(), piece.begin(), piece.end());
-                            }
+                            uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece, (int)new_id);
                         }
                     }
                     if (s.first_emit_ns == 0)
@@ -247,16 +238,12 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                 } else {
                     if (llama_vocab_is_eog(vocab_, new_id) ||
                         s.generated_count >= config_.max_tokens) {
-                        if (s.proto == uma::ipc::ProtocolMode::JSON) {
-                            uma::ipc::protocol::append_eos_event(
-                                    s.tx, s.request_id,
-                                    s.generated_count >= config_.max_tokens ? "length" : "stop");
-                        } else {
-                            s.tx.push_back('\n');
-                        }
+                        uma::ipc::protocol::append_eos_event(
+                                s.tx, s.request_id,
+                                s.generated_count >= config_.max_tokens ? "length" : "stop");
                         s.state = ipc::SessionState::STREAM;
                         llama_memory_seq_rm(llama_get_memory(ctx_), s.seq, -1, -1);
-                        // Update last emit on EOS newline
+                        // Update last emit on EOS
                         if (s.first_emit_ns == 0)
                             s.first_emit_ns = now_ns;
                         s.last_emit_ns = now_ns;
@@ -264,11 +251,7 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                         {
                             std::string piece = uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
                             if (!piece.empty()) {
-                                if (s.proto == uma::ipc::ProtocolMode::JSON) {
-                                    uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece, (int)new_id);
-                                } else {
-                                    s.tx.insert(s.tx.end(), piece.begin(), piece.end());
-                                }
+                                uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece, (int)new_id);
                             }
                         }
                         s.generated_count++;
