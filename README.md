@@ -148,7 +148,7 @@ Configuration is handled via command-line arguments and environment variables. F
 - [ ] Speculative decoding (draft/verify)
 - [ ] Request cancellation
 - [ ] QoS / Priority scheduling
-- [ ] `uma-cli` client application
+- [x] `uma-cli` client application
 - [ ] Prefix/KV cache for faster prompt processing
 - [ ] Linux `epoll` backend for the poller
 
@@ -157,7 +157,7 @@ Configuration is handled via command-line arguments and environment variables. F
 - M1 — Single‑client daemon: UDS server, one client E2E stream, model loaded once. ✓
 - M2 — Multi‑client I/O + sessions: kqueue/poller loop, session pool, stable teardown. ✓
 - M3 — Concurrent batching v0: global `llama_batch` with per‑session `seq_id`, interleaved streaming. ✓
-- M4 — Protocol + CLI + metrics tick: framed JSON ✓, metrics JSON event ✓, `uma-cli` pending.
+- M4 — Protocol + CLI + metrics tick: framed JSON ✓, metrics JSON event ✓, `uma-cli` ✓.
 
 ---
 *This project is currently in an early, experimental phase.*

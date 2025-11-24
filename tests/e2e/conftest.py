@@ -126,7 +126,6 @@ def umad_daemon_m3():
         "--n-ctx", "2048",
         "--threads", "6",
         "--max-tokens", "64",
-        "--max-merge", "2",
     ]
 
     env = os.environ.copy()

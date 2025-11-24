@@ -29,7 +29,7 @@ The data flow is as follows:
 - **`sched` (`src/sched`):** The executor that drives continuous batching. It builds a batch per tick and executes `llama_decode`.
 - **Policy (planned as a separate layer):** A standalone planning component that takes a `SchedulerState` snapshot and produces a `Plan` for the scheduler to execute. This separation enables policy experimentation (e.g., SLO‑aware guard, QoS) without touching the executor.
 - **`metrics` (`src/metrics`):** A lightweight, thread-safe component for collecting and exposing performance and health metrics.
-- **`cli` (`src/cli`):** The planned command-line interface for interacting with the daemon.
+- **`cli` (`src/cli`):** The implemented command-line interface for interacting with the daemon.
 - **`umad` (`src/umad`):** The main entry point that initializes all components and runs the primary event loop.
 
 ---
