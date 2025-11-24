@@ -34,7 +34,7 @@ static void json_escape(std::ostringstream &oss, const std::string &s) {
     }
 }
 
-std::string Metrics::to_json(uint32_t active_sessions) const {
+std::string Metrics::to_json(uint32_t active_sessions, bool debug) const {
     std::ostringstream oss;
     oss << '{'
         << "\"tokens_generated_total\":" << tokens_generated_total.load(std::memory_order_relaxed) << ','
@@ -103,9 +103,50 @@ std::string Metrics::to_json(uint32_t active_sessions) const {
             oss << std::fixed << std::setprecision(3) << static_cast<double>(ms_per_tok);
         }
     }
+    if (debug) {
+        oss << ','
+            // llama internal perf breakdown (when enabled)
+            << "\"eval_ms_last\":" << eval_ms_last.load(std::memory_order_relaxed) << ','
+            << "\"p_eval_ms_last\":" << p_eval_ms_last.load(std::memory_order_relaxed) << ','
+            << "\"eval_calls\":" << eval_calls.load(std::memory_order_relaxed) << ','
+            << "\"p_eval_calls\":" << p_eval_calls.load(std::memory_order_relaxed) << ','
+            << "\"eval_ns_total\":" << eval_ns_total.load(std::memory_order_relaxed) << ','
+            << "\"p_eval_ns_total\":" << p_eval_ns_total.load(std::memory_order_relaxed) << ','
+            << "\"eval_ms_mean\":";
+        {
+            uint64_t calls = eval_calls.load(std::memory_order_relaxed);
+            if (calls == 0) {
+                oss << 0.0;
+            } else {
+                long double ns = static_cast<long double>(eval_ns_total.load(std::memory_order_relaxed));
+                long double ms = (ns / static_cast<long double>(calls)) / 1.0e6L;
+                oss << std::fixed << std::setprecision(3) << static_cast<double>(ms);
+            }
+        }
+        oss << ','
+            << "\"p_eval_ms_mean\":";
+        {
+            uint64_t calls = p_eval_calls.load(std::memory_order_relaxed);
+            if (calls == 0) {
+                oss << 0.0;
+            } else {
+                long double ns = static_cast<long double>(p_eval_ns_total.load(std::memory_order_relaxed));
+                long double ms = (ns / static_cast<long double>(calls)) / 1.0e6L;
+                oss << std::fixed << std::setprecision(3) << static_cast<double>(ms);
+            }
+        }
+    }
     oss << ','
-        << "\"active_sessions\":" << active_sessions
-        << '}';
+        << "\"active_sessions\":" << active_sessions;
+    if (debug) {
+        oss << ','
+            // batch shape observability
+            << "\"last_decode_tokens\":" << last_decode_tokens.load(std::memory_order_relaxed) << ','
+            << "\"last_prefill_tokens\":" << last_prefill_tokens.load(std::memory_order_relaxed) << ','
+            << "\"max_batch_size_seen\":" << max_batch_size_seen.load(std::memory_order_relaxed) << ','
+            << "\"prefill_calls\":" << prefill_calls.load(std::memory_order_relaxed);
+    }
+    oss << '}';
     return oss.str();
 }
 

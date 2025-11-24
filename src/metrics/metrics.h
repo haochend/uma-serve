@@ -33,13 +33,28 @@ struct Metrics {
     std::atomic<uint64_t> decode_ns_total_gen{0};       // estimated time spent on DECODE tokens (ns)
     std::atomic<uint64_t> prefill_ns_total{0};          // estimated time spent on PREFILL tokens (ns)
 
+    // per-tick breakdown observability
+    std::atomic<uint32_t> last_decode_tokens{0};
+    std::atomic<uint32_t> last_prefill_tokens{0};
+    std::atomic<uint32_t> max_batch_size_seen{0};
+    std::atomic<uint64_t> prefill_calls{0};
+
+    // llama internal perf (optional: when perf enabled)
+    std::atomic<uint32_t> eval_ms_last{0};
+    std::atomic<uint32_t> p_eval_ms_last{0};
+    std::atomic<uint64_t> eval_ns_total{0};
+    std::atomic<uint64_t> p_eval_ns_total{0};
+    std::atomic<uint64_t> eval_calls{0};
+    std::atomic<uint64_t> p_eval_calls{0};
+
     // Write EWMA (ms) in fixed-point x1000
     void set_decode_ms_ewma(double ms);
     double get_decode_ms_ewma() const;
 
     // Snapshot to compact JSON string
     // active_sessions is provided by caller at snapshot time
-    std::string to_json(uint32_t active_sessions) const;
+    // When debug=true, include extended fields (perf + batch-shape)
+    std::string to_json(uint32_t active_sessions, bool debug = false) const;
 };
 
 } // namespace uma::metrics

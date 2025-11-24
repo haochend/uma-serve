@@ -25,7 +25,7 @@ LlamaBackendGuard::~LlamaBackendGuard() {
 static llama_model_params make_model_params(const RuntimeConfig& cfg) {
     auto mp = llama_model_default_params();
     mp.use_mlock = cfg.use_mlock;
-    mp.use_mmap  = cfg.use_mmap;
+    mp.use_mmap = cfg.use_mmap;
     // Leave GPU offload defaults as-is to allow Metal/Vulkan auto-routing
     return mp;
 }
@@ -35,18 +35,24 @@ static llama_context_params make_context_params(const RuntimeConfig& cfg) {
     if (cfg.n_ctx > 0) {
         cp.n_ctx = cfg.n_ctx;
     }
+    if (cfg.n_batch > 0) {
+        cp.n_batch = cfg.n_batch;
+    }
+    if (cfg.n_ubatch > 0) {
+        cp.n_ubatch = cfg.n_ubatch;
+    }
     if (cfg.n_threads > 0) {
         cp.n_threads = cfg.n_threads;
         cp.n_threads_batch = cfg.n_threads;
     }
-    // enable multi-sequence for batching
+    // enable multi-sequence for batching: align with max_sessions
     cp.n_seq_max = std::max<uint32_t>(cfg.max_sessions, 1);
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     cp.offload_kqv = cfg.offload_kqv; // let backend move KQV to device if capable
-    cp.kv_unified  = cfg.kv_unified;  // persistent unified KV allocator buffer
-    cp.swa_full    = cfg.swa_full;    // persistent SWA cache
-    // Keep perf timers off in daemon
-    cp.no_perf = true;
+    cp.kv_unified = cfg.kv_unified;   // persistent unified KV allocator buffer
+    cp.swa_full = cfg.swa_full;       // persistent SWA cache
+    // Enable perf timers only when requested (adds overhead)
+    cp.no_perf = !cfg.enable_perf;
     cp.op_offload = true;
     return cp;
 }
@@ -73,12 +79,15 @@ ModelHandle::~ModelHandle() {
     }
 }
 
-std::unique_ptr<llama_context, void(*)(llama_context*)> ModelHandle::new_context() const {
+std::unique_ptr<llama_context, void (*)(llama_context*)> ModelHandle::new_context() const {
     auto* ctx = llama_init_from_model(model_, *ctx_params_);
     if (!ctx) {
         throw std::runtime_error("Failed to create llama_context");
     }
-    return std::unique_ptr<llama_context, void(*)(llama_context*)>(ctx, [](llama_context* c){ if (c) llama_free(c); });
+    return std::unique_ptr<llama_context, void (*)(llama_context*)>(ctx, [](llama_context* c) {
+        if (c)
+            llama_free(c);
+    });
 }
 
 } // namespace uma::runtime

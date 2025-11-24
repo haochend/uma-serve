@@ -1,6 +1,7 @@
 // UMA Serve — Daemon + model lifecycle (M1 subset)
 
 #include "ipc/poller.h"
+#include "ipc/protocol.h"
 #include "ipc/session.h"
 #include "ipc/session_manager.h"
 #include "ipc/uds_server.h"
@@ -10,7 +11,6 @@
 #include "runtime/tokens.h"
 #include "sched/scheduler.h"
 #include "util/logging.h"
-#include "ipc/protocol.h"
 
 #include "llama.h"
 
@@ -51,7 +51,7 @@ void install_signal_handlers() {
 void print_usage() {
     std::cout << "umad - UMA Serve runtime daemon (M1 foundations)\n"
               << "Usage: umad --model /path/model.gguf [--n-ctx 4096] [--threads N] [--mlock] "
-                 "[--{no-}mmap] [--socket /tmp/uma.sock]\n\n"
+                 "[--{no-}mmap] [--socket /tmp/uma.sock] [--max-sessions N] [--max-tokens N]\n\n"
               << "Env: UMA_MODEL, UMA_N_CTX, UMA_THREADS, UMA_USE_MMAP, UMA_USE_MLOCK, UMA_SOCK\n";
 }
 
@@ -105,6 +105,7 @@ int main(int argc, char** argv) {
         auto admin_ctx = model.new_context();
         UMA_LOG_INFO() << "Context ready: n_ctx_resolved=" << llama_n_ctx(admin_ctx.get())
                        << " n_batch_resolved=" << llama_n_batch(admin_ctx.get())
+                       << " n_ubatch_resolved=" << llama_n_ubatch(admin_ctx.get())
                        << " n_threads=" << cfg.n_threads;
         UMA_LOG_DEBUG() << "model_has_encoder="
                         << (llama_model_has_encoder(model.get()) ? "true" : "false")
@@ -196,9 +197,11 @@ int main(int argc, char** argv) {
                         goto next_event;
                     auto& s = *sp;
                     if (rr.admin_request) {
-                        std::string js = mtx.to_json((uint32_t)sessions.map().size());
+                        bool dbg = uma::util::Logger::instance().should(uma::util::LogLevel::Debug);
+                        std::string js = mtx.to_json((uint32_t)sessions.map().size(), dbg);
                         // Wrap metrics in an event
-                        std::string payload = std::string("{\"event\":\"metrics\",\"metrics\":") + js + "}";
+                        std::string payload =
+                                std::string("{\"event\":\"metrics\",\"metrics\":") + js + "}";
                         uma::ipc::protocol::write_frame(s.tx, payload);
                         // One-shot admin response: close after flushing
                         s.state = uma::ipc::SessionState::STREAM;
@@ -234,6 +237,7 @@ int main(int argc, char** argv) {
                                     s.prefill_idx = 0;
                                     s.generated_count = 0;
                                     s.has_pending_tok = false;
+                                    s.n_past = 0;
                                     s.req_start_ns = 0;
                                     s.first_emit_ns = 0;
                                     s.last_emit_ns = 0;
@@ -278,6 +282,7 @@ int main(int argc, char** argv) {
                                 s.prefill_idx = 0;
                                 s.generated_count = 0;
                                 s.has_pending_tok = false;
+                                s.n_past = 0;
                                 s.req_start_ns = 0;
                                 s.first_emit_ns = 0;
                                 s.last_emit_ns = 0;

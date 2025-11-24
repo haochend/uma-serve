@@ -17,6 +17,8 @@ The metrics endpoint is exposed over the same Unix Domain Socket (UDS) as the in
 
 ## Current Metrics (M3 Stub)
 
+Note: Some extended metrics (backend perf breakdown and batch-shape fields) are only included when running with debug logging enabled (set `UMA_LOG_LEVEL=debug`).
+
 The current implementation provides a minimal set of core metrics to gauge the basic activity and performance of the scheduler and decoder.
 
 | Metric                   | Type    | Description                                                                                               |

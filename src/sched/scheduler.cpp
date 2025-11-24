@@ -1,8 +1,8 @@
 #include "sched/scheduler.h"
+#include "ipc/protocol.h"
 #include "ipc/session.h"
 #include "llama.h"
 #include "runtime/tokens.h"
-#include "ipc/protocol.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,7 +18,8 @@ Scheduler::Scheduler(llama_context* ctx, const llama_vocab* vocab,
                      const runtime::RuntimeConfig& cfg, uma::metrics::Metrics* m)
     : ctx_(ctx), vocab_(vocab), config_(cfg), metrics_(m) {
     batch_cap_ = llama_n_batch(ctx);
-    target_batch_ = std::min<int32_t>(batch_cap_, 32);
+    // Experiment: start with full backend batch capacity to better utilize device during prefill
+    target_batch_ = batch_cap_;
     rr_decode_idx_ = rr_prefill_idx_ = 0;
     decode_ms_ewma_ = tick_budget_ms_;
     if (metrics_) {
@@ -37,6 +38,8 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
     seq_ids.reserve(batch_cap_);
     std::vector<int8_t> logits;
     logits.reserve(batch_cap_);
+    std::vector<llama_pos> pos;
+    pos.reserve(batch_cap_);
 
     struct SampleRef {
         int fd;
@@ -82,6 +85,7 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
             n_seq_id.push_back(1);
             seq_id_vals.push_back((llama_seq_id)s.seq);
             seq_ids.push_back(&seq_id_vals.back());
+            pos.push_back((llama_pos)s.n_past);
             logits.push_back(1);
             samples.push_back({s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::DECODE});
             budget--;
@@ -100,18 +104,25 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
         for (size_t i = 0; i < prefill_pool.size(); ++i) {
             int curr_fd = prefill_pool[(rr_prefill_idx_ + i) % prefill_pool.size()];
             auto it = sessions.find(curr_fd);
-            if (it == sessions.end()) continue;
+            if (it == sessions.end())
+                continue;
             auto& s = *it->second;
-            if (s.first_emit_ns == 0) ttft_pool.push_back(curr_fd); else rest_pool.push_back(curr_fd);
+            if (s.first_emit_ns == 0)
+                ttft_pool.push_back(curr_fd);
+            else
+                rest_pool.push_back(curr_fd);
         }
         auto schedule_pool = [&](const std::vector<int>& pool) {
             for (int curr_fd : pool) {
-                if (budget <= 0) break;
+                if (budget <= 0)
+                    break;
                 auto it = sessions.find(curr_fd);
-                if (it == sessions.end()) continue;
+                if (it == sessions.end())
+                    continue;
                 auto& s = *it->second;
                 size_t remain_sz = s.prompt_tokens.size() - s.prefill_idx;
-                int32_t remain = static_cast<int32_t>(std::min(remain_sz, static_cast<size_t>(INT32_MAX)));
+                int32_t remain =
+                        static_cast<int32_t>(std::min(remain_sz, static_cast<size_t>(INT32_MAX)));
                 int32_t chunk = std::min<int32_t>(remain, budget);
                 // Limit per-session burst for TTFT sessions to avoid starving others
                 if (s.first_emit_ns == 0) {
@@ -119,24 +130,29 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                     chunk = std::min<int32_t>(chunk, kBurst);
                 }
                 assert(chunk >= 0 && "prefill chunk size is less than 0");
+                const int32_t base_pos = s.n_past;
                 for (int32_t j = 0; j < chunk; ++j) {
                     llama_token t = static_cast<llama_token>(s.prompt_tokens[s.prefill_idx++]);
                     tokens.push_back(t);
                     n_seq_id.push_back(1);
                     seq_id_vals.push_back(s.seq);
                     seq_ids.push_back(&seq_id_vals.back());
+                    pos.push_back((llama_pos)(base_pos + j));
                     int8_t lg = (j == chunk - 1) ? 1 : 0;
                     logits.push_back(lg);
                     if (lg) {
-                        samples.push_back({s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::PREFILL});
+                        samples.push_back(
+                                {s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::PREFILL});
                     }
                     prefill_tok_count += 1;
                 }
                 budget -= chunk;
+                s.n_past = base_pos + chunk;
             }
         };
         schedule_pool(ttft_pool);
-        if (budget > 0) schedule_pool(rest_pool);
+        if (budget > 0)
+            schedule_pool(rest_pool);
         rr_prefill_idx_ = (rr_prefill_idx_ + 1) % prefill_pool.size();
     }
 
@@ -156,14 +172,17 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
         batch.n_tokens = static_cast<int32_t>(tokens.size());
         batch.token = tokens.data();
         batch.embd = nullptr;
-        batch.pos = nullptr; // auto-track positions per seq
+        batch.pos = pos.data();
         batch.n_seq_id = n_seq_id.data();
         batch.seq_id = seq_ids.data();
         batch.logits = logits.data();
 
+        if (config_.enable_perf) {
+            llama_perf_context_reset(ctx_);
+        }
         auto t0 = std::chrono::steady_clock::now();
         int dec_rc = llama_decode(ctx_, batch);
-        // Ensure all queued backend work has finished so timing reflects real compute
+        // Always synchronize to reflect real compute time in wall clock
         llama_synchronize(ctx_);
         auto t1 = std::chrono::steady_clock::now();
         auto dur_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -178,15 +197,15 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
             // Split accounting: attribute total time proportionally to token counts
             const uint64_t tot_tok = static_cast<uint64_t>(tokens.size());
             const uint64_t gen_tok = static_cast<uint64_t>(decode_tok_count);
-            const uint64_t pf_tok  = static_cast<uint64_t>(prefill_tok_count);
+            const uint64_t pf_tok = static_cast<uint64_t>(prefill_tok_count);
             metrics_->decode_phase_tokens_total.fetch_add(gen_tok, std::memory_order_relaxed);
             metrics_->prefill_tokens_total.fetch_add(pf_tok, std::memory_order_relaxed);
 
             uint64_t gen_ns = 0;
-            uint64_t pf_ns  = 0;
+            uint64_t pf_ns = 0;
             if (tot_tok > 0) {
                 gen_ns = static_cast<uint64_t>((__int128)dur_ns * gen_tok / tot_tok);
-                pf_ns  = static_cast<uint64_t>(dur_ns) - gen_ns;
+                pf_ns = static_cast<uint64_t>(dur_ns) - gen_ns;
             }
             metrics_->decode_ns_total_gen.fetch_add(gen_ns, std::memory_order_relaxed);
             metrics_->prefill_ns_total.fetch_add(pf_ns, std::memory_order_relaxed);
@@ -200,9 +219,29 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                 metrics_->decode_tokens_total.fetch_add(gen_tok, std::memory_order_relaxed);
                 // Min/max (single-threaded writer; relaxed is fine)
                 uint32_t cur_min = metrics_->decode_ms_min.load(std::memory_order_relaxed);
-                if (gen_ms_u32 < cur_min) metrics_->decode_ms_min.store(gen_ms_u32, std::memory_order_relaxed);
+                if (gen_ms_u32 < cur_min)
+                    metrics_->decode_ms_min.store(gen_ms_u32, std::memory_order_relaxed);
                 uint32_t cur_max = metrics_->decode_ms_max.load(std::memory_order_relaxed);
-                if (gen_ms_u32 > cur_max) metrics_->decode_ms_max.store(gen_ms_u32, std::memory_order_relaxed);
+                if (gen_ms_u32 > cur_max)
+                    metrics_->decode_ms_max.store(gen_ms_u32, std::memory_order_relaxed);
+            }
+
+            // llama internal perf breakdown (optional)
+            if (config_.enable_perf) {
+                auto pdata = llama_perf_context(ctx_);
+                uint32_t eval_ms = static_cast<uint32_t>(pdata.t_eval_ms + 0.5);
+                uint32_t p_eval_ms = static_cast<uint32_t>(pdata.t_p_eval_ms + 0.5);
+                metrics_->eval_ms_last.store(eval_ms, std::memory_order_relaxed);
+                metrics_->p_eval_ms_last.store(p_eval_ms, std::memory_order_relaxed);
+                metrics_->eval_ns_total.fetch_add((uint64_t)(pdata.t_eval_ms * 1.0e6),
+                                                  std::memory_order_relaxed);
+                metrics_->p_eval_ns_total.fetch_add((uint64_t)(pdata.t_p_eval_ms * 1.0e6),
+                                                    std::memory_order_relaxed);
+                // increment calls if non-zero to avoid counting empty resets
+                if (pdata.n_eval > 0)
+                    metrics_->eval_calls.fetch_add(1, std::memory_order_relaxed);
+                if (pdata.n_p_eval > 0)
+                    metrics_->p_eval_calls.fetch_add(1, std::memory_order_relaxed);
             }
         }
         // EWMA toward observed decode time + publish
@@ -227,7 +266,7 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                 s.last_error = "decode error";
                 s.state = ipc::SessionState::ERRORED;
                 uma::ipc::protocol::append_error_event(s.tx, s.request_id, "E_RUNTIME_DECODE",
-                                                      "decode failed");
+                                                       "decode failed");
                 s.read_closed = true;
             }
         } else {
@@ -260,9 +299,11 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                     s.has_pending_tok = true;
                     s.state = ipc::SessionState::DECODE;
                     {
-                        std::string piece = uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
+                        std::string piece =
+                                uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
                         if (!piece.empty()) {
-                            uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece, (int)new_id);
+                            uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece,
+                                                                   (int)new_id);
                         }
                     }
                     if (s.first_emit_ns == 0)
@@ -278,20 +319,24 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                                 s.generated_count >= config_.max_tokens ? "length" : "stop");
                         s.state = ipc::SessionState::STREAM;
                         llama_memory_seq_rm(llama_get_memory(ctx_), s.seq, -1, -1);
+                        s.n_past = 0;
                         // Update last emit on EOS
                         if (s.first_emit_ns == 0)
                             s.first_emit_ns = now_ns;
                         s.last_emit_ns = now_ns;
                     } else {
                         {
-                            std::string piece = uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
+                            std::string piece =
+                                    uma::runtime::tokens::token_to_piece_str(vocab_, new_id, true);
                             if (!piece.empty()) {
-                                uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece, (int)new_id);
+                                uma::ipc::protocol::append_token_event(s.tx, s.request_id, piece,
+                                                                       (int)new_id);
                             }
                         }
                         s.generated_count++;
                         s.pending_tok = new_id;
                         s.has_pending_tok = true;
+                        s.n_past += 1; // we consumed the previously pending token this tick
                         s.state = ipc::SessionState::DECODE;
                         if (s.first_emit_ns == 0)
                             s.first_emit_ns = now_ns;

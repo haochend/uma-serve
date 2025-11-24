@@ -11,14 +11,24 @@ include(CTest)
 enable_testing()
 
 # --- 2. Configure llama.cpp (The "Engine") ---
-# Set llama.cpp's build options BEFORE adding it.
+# Set llama.cpp / ggml build options BEFORE adding it.
 set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "")
+
+# Prefer Metal-only build for UMA serving; explicitly disable BLAS/Accelerate to avoid
+# registering extra backends (which increases reserved compute buffers on Metal).
+set(GGML_METAL ON  CACHE INTERNAL "")
+set(GGML_BLAS OFF  CACHE INTERNAL "")
+set(GGML_ACCELERATE OFF CACHE INTERNAL "")
+
+# Legacy/deprecated options kept for compatibility (mapped inside llama.cpp)
 set(LLAMA_METAL ON CACHE INTERNAL "")
+
 set(LLAMA_BUILD_TESTS OFF CACHE INTERNAL "")
 set(LLAMA_BUILD_EXAMPLES OFF CACHE INTERNAL "")
 
 # --- 3. Add the llama.cpp Submodule ---
 # This pulls in the llama.cpp project and defines its targets
+set(LLAMA_ACCELERATE OFF CACHE INTERNAL "")
 add_subdirectory(external/llama.cpp)
 add_subdirectory(external/googletest)
 include(GoogleTest)
