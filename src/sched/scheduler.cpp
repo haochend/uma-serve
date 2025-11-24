@@ -51,34 +51,19 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
 
     std::vector<int> result_fds;
 
-    std::vector<int> decode_pool;
-    std::vector<int> prefill_pool;
-    for (auto& kv : sessions) {
-        auto& s = *kv.second;
-        if (s.state == ipc::SessionState::DECODE && s.has_pending_tok) {
-            decode_pool.push_back(s.fd);
-        } else if (s.state == ipc::SessionState::PREFILL &&
-                   s.prefill_idx < s.prompt_tokens.size()) {
-            prefill_pool.push_back(s.fd);
-        }
-    }
+    // Use policy to plan this tick
+    Plan plan = policy_.schedule_tick(sessions, batch_cap_, target_batch_, rr_decode_idx_,
+                                      rr_prefill_idx_);
+    // Apply RR cursor updates
+    rr_decode_idx_ = plan.next_rr_decode_idx;
+    rr_prefill_idx_ = plan.next_rr_prefill_idx;
 
-    int32_t budget = std::min<int32_t>(target_batch_, batch_cap_);
-    assert(budget > 0 && "batch budget must be > 0");
-
-    // handling Decode: give exactly 1 token to each ready DECODE session (round-robin), up to
-    // budget
-    int32_t decode_tok_count = 0;
-    int32_t prefill_tok_count = 0;
-    if (!decode_pool.empty() && budget > 0) {
-        for (size_t i = 0; i < decode_pool.size() && budget > 0; ++i) {
-            int curr_fd = decode_pool[(rr_decode_idx_ + i) % decode_pool.size()];
-            auto it = sessions.find(curr_fd);
-            if (it == sessions.end()) {
-                continue;
-            }
-            auto& s = *it->second;
-            // Append the pending token
+    // Enact the plan: fill tokens arrays and session updates according to items
+    for (const auto& item : plan.items) {
+        auto it = sessions.find(item.fd);
+        if (it == sessions.end()) continue;
+        auto& s = *it->second;
+        if (item.phase == uma::sched::Phase::DECODE) {
             llama_token t = static_cast<llama_token>(s.pending_tok);
             s.has_pending_tok = false;
             tokens.push_back(t);
@@ -88,72 +73,25 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
             pos.push_back((llama_pos)s.n_past);
             logits.push_back(1);
             samples.push_back({s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::DECODE});
-            budget--;
-            decode_tok_count += 1;
-        }
-        rr_decode_idx_ = (rr_decode_idx_ + 1) % decode_pool.size();
-    }
-
-    // handling Prefill: drain large chunks up to remaining budget.
-    // Prioritize sessions that haven't emitted their first token (TTFT-first), then others.
-    if (!prefill_pool.empty() && budget > 0) {
-        std::vector<int> ttft_pool;
-        std::vector<int> rest_pool;
-        ttft_pool.reserve(prefill_pool.size());
-        rest_pool.reserve(prefill_pool.size());
-        for (size_t i = 0; i < prefill_pool.size(); ++i) {
-            int curr_fd = prefill_pool[(rr_prefill_idx_ + i) % prefill_pool.size()];
-            auto it = sessions.find(curr_fd);
-            if (it == sessions.end())
-                continue;
-            auto& s = *it->second;
-            if (s.first_emit_ns == 0)
-                ttft_pool.push_back(curr_fd);
-            else
-                rest_pool.push_back(curr_fd);
-        }
-        auto schedule_pool = [&](const std::vector<int>& pool) {
-            for (int curr_fd : pool) {
-                if (budget <= 0)
-                    break;
-                auto it = sessions.find(curr_fd);
-                if (it == sessions.end())
-                    continue;
-                auto& s = *it->second;
-                size_t remain_sz = s.prompt_tokens.size() - s.prefill_idx;
-                int32_t remain =
-                        static_cast<int32_t>(std::min(remain_sz, static_cast<size_t>(INT32_MAX)));
-                int32_t chunk = std::min<int32_t>(remain, budget);
-                // Limit per-session burst for TTFT sessions to avoid starving others
-                if (s.first_emit_ns == 0) {
-                    const int32_t kBurst = 16;
-                    chunk = std::min<int32_t>(chunk, kBurst);
+        } else { // PREFILL
+            const int32_t chunk = item.n_tokens;
+            assert(chunk >= 0 && "prefill chunk size is less than 0");
+            const int32_t base_pos = s.n_past;
+            for (int32_t j = 0; j < chunk; ++j) {
+                llama_token t = static_cast<llama_token>(s.prompt_tokens[s.prefill_idx++]);
+                tokens.push_back(t);
+                n_seq_id.push_back(1);
+                seq_id_vals.push_back(s.seq);
+                seq_ids.push_back(&seq_id_vals.back());
+                pos.push_back((llama_pos)(base_pos + j));
+                int8_t lg = (j == chunk - 1) ? 1 : 0;
+                logits.push_back(lg);
+                if (lg) {
+                    samples.push_back({s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::PREFILL});
                 }
-                assert(chunk >= 0 && "prefill chunk size is less than 0");
-                const int32_t base_pos = s.n_past;
-                for (int32_t j = 0; j < chunk; ++j) {
-                    llama_token t = static_cast<llama_token>(s.prompt_tokens[s.prefill_idx++]);
-                    tokens.push_back(t);
-                    n_seq_id.push_back(1);
-                    seq_id_vals.push_back(s.seq);
-                    seq_ids.push_back(&seq_id_vals.back());
-                    pos.push_back((llama_pos)(base_pos + j));
-                    int8_t lg = (j == chunk - 1) ? 1 : 0;
-                    logits.push_back(lg);
-                    if (lg) {
-                        samples.push_back(
-                                {s.fd, (int)tokens.size() - 1, uma::ipc::SessionState::PREFILL});
-                    }
-                    prefill_tok_count += 1;
-                }
-                budget -= chunk;
-                s.n_past = base_pos + chunk;
             }
-        };
-        schedule_pool(ttft_pool);
-        if (budget > 0)
-            schedule_pool(rest_pool);
-        rr_prefill_idx_ = (rr_prefill_idx_ + 1) % prefill_pool.size();
+            s.n_past = base_pos + chunk;
+        }
     }
 
     if (!tokens.empty()) {
@@ -196,8 +134,8 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
 
             // Split accounting: attribute total time proportionally to token counts
             const uint64_t tot_tok = static_cast<uint64_t>(tokens.size());
-            const uint64_t gen_tok = static_cast<uint64_t>(decode_tok_count);
-            const uint64_t pf_tok = static_cast<uint64_t>(prefill_tok_count);
+            const uint64_t gen_tok = static_cast<uint64_t>(plan.decode_tok_count);
+            const uint64_t pf_tok = static_cast<uint64_t>(plan.prefill_tok_count);
             metrics_->decode_phase_tokens_total.fetch_add(gen_tok, std::memory_order_relaxed);
             metrics_->prefill_tokens_total.fetch_add(pf_tok, std::memory_order_relaxed);
 

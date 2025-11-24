@@ -40,6 +40,7 @@ add_executable(umad
     src/runtime/model.cpp
     src/runtime/tokens.cpp
     src/sched/scheduler.cpp
+    src/sched/policy.cpp
     src/metrics/metrics.cpp
     src/ipc/uds_server.cpp
     src/ipc/protocol.cpp
@@ -79,7 +80,9 @@ target_include_directories(uma_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_executable(uma_unit_tests
     tests/cpp/test_main.cpp
     tests/cpp/ipc_protocol_test.cpp
+    tests/cpp/policy_test.cpp
     src/ipc/protocol.cpp
+    src/sched/policy.cpp
 )
 target_link_libraries(uma_unit_tests PRIVATE gtest_main)
 target_include_directories(uma_unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

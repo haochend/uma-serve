@@ -85,7 +85,7 @@ Or use the built CLI:
 
 ## Testing
 
-The project uses `pytest` for end-to-end tests and GoogleTest for C++ unit tests.
+The project uses `pytest` for end-to-end tests and GoogleTest for C++ unit tests. See `docs/TESTING.md` for details and tips.
 
 To run the Python E2E tests:
 ```sh
@@ -107,6 +107,11 @@ To run the C++ unit tests:
 ctest --test-dir build
 ```
 
+Perf smoke (metrics):
+```sh
+pytest -k perf_smoke -q
+```
+
 ## Documentation
 
 For detailed information on the project's design and features, please see the `docs` directory:
@@ -117,7 +122,9 @@ For detailed information on the project's design and features, please see the `d
 - **[Policy](./docs/POLICY.md):** The standalone planning layer and transformer pipeline.
 - **[Memory Management](./docs/MEMORY.md):** KV cache and memory sharing strategy.
 - **[Metrics](./docs/METRICS.md):** The metrics endpoint and available performance data.
+- **[Testing](./docs/TESTING.md):** How to run unit, E2E, and perf smoke tests.
 - **[Configuration](./docs/CONFIG.md):** All command-line arguments and environment variables.
+- **[Build](./docs/BUILD.md):** Build configuration (Metal-only) and verification.
 - **[Optimization Catalog](./docs/OPTIMIZATIONS.md):** Prioritized list of high‑value UMA wedges and serving optimizations.
 - **[Findings](./docs/FINDINGS.md):** Current benchmark results and user‑felt pain points.
 - **[Directions](./docs/DIRECTIONS.md):** Serving policy and UMA‑specific strategies (time guard, ΣBMT, MoE shaping).
