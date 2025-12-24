@@ -228,6 +228,50 @@ SessionManager::ReadResult SessionManager::on_readable(int fd,
     }
     s.request_id = req_id;
 
+    // Minimal numeric extractor: parses unquoted JSON numbers after key
+    auto extract_json_number = [](const std::string& j, const char* key,
+                                  bool& found, double& out_val) {
+        found = false;
+        out_val = 0.0;
+        std::string k = std::string("\"") + key + "\"";
+        size_t p = j.find(k);
+        if (p == std::string::npos) return;
+        size_t colon = j.find(':', p);
+        if (colon == std::string::npos) return;
+        // skip whitespace
+        size_t i = colon + 1;
+        while (i < j.size() && (j[i] == ' ' || j[i] == '\t' || j[i] == '\n' || j[i] == '\r')) ++i;
+        if (i >= j.size()) return;
+        // read until delimiter (comma or closing brace)
+        size_t start = i;
+        while (i < j.size()) {
+            char c = j[i];
+            if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == 'e' || c == 'E' || c == '.') {
+                ++i;
+                continue;
+            }
+            break;
+        }
+        if (i == start) return;
+        std::string num = j.substr(start, i - start);
+        char* endp = nullptr;
+        out_val = std::strtod(num.c_str(), &endp);
+        if (endp && endp != num.c_str()) {
+            found = true;
+        }
+    };
+
+    // Optional sampling preferences (per-request). If not present, keep defaults in session.
+    {
+        bool f = false; double v = 0.0;
+        extract_json_number(js, "temperature", f, v);
+        if (f) s.temperature = v;
+        extract_json_number(js, "top_p", f, v);
+        if (f) s.top_p = v;
+        extract_json_number(js, "top_k", f, v);
+        if (f) s.top_k = (int32_t) v;
+    }
+
     // size limit (bytes) on prompt
     if (prompt.size() > cfg.max_prompt_bytes) {
         uma::ipc::protocol::append_error_event(s.tx, s.request_id, "E_LIMIT_001",

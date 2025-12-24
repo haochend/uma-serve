@@ -3,6 +3,7 @@
 #include "ipc/session.h"
 #include "llama.h"
 #include "runtime/tokens.h"
+#include "sched/bmt.h"
 
 #include <algorithm>
 #include <atomic>
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace uma::sched {
@@ -54,6 +56,44 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
     // Use policy to plan this tick
     Plan plan = policy_.schedule_tick(sessions, batch_cap_, target_batch_, rr_decode_idx_,
                                       rr_prefill_idx_);
+    // BMT guard (experimental): trim PREFILL to stay within budget units, if configured
+    if (config_.bmt_budget_units > 0) {
+        uint64_t est = uma::sched::bmt::estimate_units(sessions, plan);
+        bool trimmed = false;
+        if (est > config_.bmt_budget_units) {
+            // Build base n_past per FD for PREFILL cost updates
+            std::unordered_map<int, uint64_t> base_npast;
+            base_npast.reserve(sessions.size());
+            for (auto& kv : sessions) {
+                base_npast.emplace(kv.first, (uint64_t) kv.second->n_past);
+            }
+            for (int idx = (int)plan.items.size() - 1; idx >= 0 && est > config_.bmt_budget_units; --idx) {
+                auto& it = plan.items[(size_t) idx];
+                if (it.phase != uma::sched::Phase::PREFILL || it.n_tokens <= 0) continue;
+                uint64_t base = base_npast[it.fd];
+                // remove tokens from the end of the chunk until under budget
+                while (it.n_tokens > 0 && est > config_.bmt_budget_units) {
+                    // cost of last token in chunk m: base + m
+                    uint64_t m = (uint64_t) it.n_tokens;
+                    uint64_t tok_cost = base + m;
+                    it.n_tokens -= 1;
+                    est -= tok_cost;
+                    plan.prefill_tok_count -= 1;
+                    trimmed = true;
+                }
+            }
+        }
+        if (metrics_) {
+            metrics_->bmt_budget_units.store(config_.bmt_budget_units, std::memory_order_relaxed);
+            metrics_->bmt_units_last.store(est, std::memory_order_relaxed);
+            if (trimmed) {
+                metrics_->bmt_guard_active.store(1, std::memory_order_relaxed);
+                metrics_->bmt_guard_activations.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                metrics_->bmt_guard_active.store(0, std::memory_order_relaxed);
+            }
+        }
+    }
     // Apply RR cursor updates
     rr_decode_idx_ = plan.next_rr_decode_idx;
     rr_prefill_idx_ = plan.next_rr_prefill_idx;
@@ -221,16 +261,12 @@ std::vector<int> Scheduler::tick(ipc::SessionPool& sessions, uint64_t now_ns) {
                 if (logits_row == nullptr) {
                     continue;
                 }
-                // greedy sampling
-                int best_id = 0;
-                float bestv = logits_row[0];
-                for (size_t j = 1; j < n_vocab; ++j) {
-                    if (logits_row[j] > bestv) {
-                        best_id = j;
-                        bestv = logits_row[j];
-                    }
-                }
-                llama_token new_id = static_cast<llama_token>(best_id);
+                // pluggable sampling (default: temperature + top-p)
+                SamplingParams sp{};
+                sp.temperature = static_cast<float>(s.temperature);
+                sp.top_p = static_cast<float>(s.top_p);
+                sp.top_k = s.top_k;
+                llama_token new_id = sampler_.sample(logits_row, n_vocab, sp, rng_);
                 if (sample.state_before == ipc::SessionState::PREFILL) {
                     // transition to DECODE; feed this token next tick
                     s.pending_tok = new_id;

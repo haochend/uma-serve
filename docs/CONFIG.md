@@ -27,6 +27,7 @@ The `umad` daemon can be configured via command-line arguments and environment v
 | `--max-sessions <n>`      | (none)                 | int    | `16`               | Maximum number of concurrent client sessions.                            |
 | `--max-tokens <n>`        | (none)                 | int    | `64`               | Default maximum number of tokens to generate for a request.              |
 | `--max-sessions <n>`      | (none)                 | int    | `16`               | Maximum number of concurrent client sessions.                            |
+| `--parallel <n>`          | `UMA_N_SEQ`            | int    | `4`                | Max concurrent sequences in the llama context (aligns with llama-server `--parallel`). |
 
 ### Advanced (env only)
 
@@ -49,6 +50,12 @@ Note: CLI flags override env defaults. Unknown CLI flags are rejected.
 | `--slo-ttft-ms <ms>`  | `UMA_SLO_TTFT_MS`    | int  | `150`   | **(Experimental)** Service-Level Objective for Time-To-First-Token in milliseconds.                     |
 | `--slo-tbt-ms <ms>`   | `UMA_SLO_TBT_MS`     | int  | `80`    | **(Experimental)** Service-Level Objective for inter-token latency (Time-Between-Tokens) in milliseconds. |
 | `--max-merge <n>`     | (none)               | int  | `2`     | **(Legacy)** A test-related flag to limit batch merging. May be removed in the future.                  |
+
+### Bandwidth Guard (ΣBMT, experimental)
+
+| Flag                     | Environment Variable | Type  | Default | Description |
+| ------------------------ | -------------------- | ----- | ------- | ----------- |
+| `--bmt-budget <units>`   | `UMA_BMT_BUDGET`     | uint64| `0`     | Enables a coarse UMA bandwidth guard when >0. Units are dimensionless “token‑attention units”. The guard trims PREFILL to keep the estimated ΣBMT per tick under budget. |
 
 ## Planned Configuration Options
 

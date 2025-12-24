@@ -28,10 +28,16 @@ struct RuntimeConfig {
 
     // Scheduling (M3)
     uint32_t max_merge = 4; // max sessions to merge per tick
+    // Max concurrent sequences in llama context (align with llama-server's --parallel)
+    uint32_t n_seq_max = 4; // default 4 to match server behavior
 
     // SLO instrumentation (for future policy)
     uint32_t slo_ttft_ms = 150; // target TTFT in ms (unused by executor)
     uint32_t slo_tbt_ms = 80;   // target inter-token budget in ms (unused by executor)
+
+    // Bandwidth guard (ΣBMT) experimental budget in dimensionless "token-attention units".
+    // 0 disables the guard.
+    uint64_t bmt_budget_units = 0;
 
     // llama.cpp model params
     bool use_mmap = true;

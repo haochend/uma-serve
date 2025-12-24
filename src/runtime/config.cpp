@@ -37,6 +37,8 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
         cfg.n_ubatch = static_cast<uint32_t>(std::strtoul(ub, nullptr, 10));
     if (auto* sp = get_env("UMA_SOCK"))
         cfg.socket_path = sp;
+    if (auto* v = get_env("UMA_N_SEQ"))
+        cfg.n_seq_max = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
     if (auto* v = get_env("UMA_USE_MMAP"))
         cfg.use_mmap = parse_bool_flag(v);
     if (auto* v = get_env("UMA_USE_MLOCK"))
@@ -45,6 +47,10 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
         cfg.slo_ttft_ms = (uint32_t)std::strtoul(v, nullptr, 10);
     if (auto* v = get_env("UMA_SLO_TBT_MS"))
         cfg.slo_tbt_ms = (uint32_t)std::strtoul(v, nullptr, 10);
+    if (auto* v = get_env("UMA_BMT_BUDGET")) {
+        // dimensionless token-attention units (uint64)
+        cfg.bmt_budget_units = (uint64_t) std::strtoull(v, nullptr, 10);
+    }
 
     // Gate debug features under UMA_LOG_LEVEL=debug
     {
@@ -88,8 +94,13 @@ RuntimeConfig RuntimeConfig::from_args(int argc, char** argv) {
         } else if (arg == "--max-sessions") {
             cfg.max_sessions =
                     static_cast<uint32_t>(std::strtoul(need("--max-sessions"), nullptr, 10));
+        } else if (arg == "--parallel" || arg == "--n-seq-max") {
+            cfg.n_seq_max = static_cast<uint32_t>(std::strtoul(need("--parallel"), nullptr, 10));
         } else if (arg == "--max-tokens") {
             cfg.max_tokens = static_cast<uint32_t>(std::strtoul(need("--max-tokens"), nullptr, 10));
+        } else if (arg == "--bmt-budget") {
+            // experimental: dimensionless token-attention units
+            cfg.bmt_budget_units = (uint64_t) std::strtoull(need("--bmt-budget"), nullptr, 10);
         } else if (arg == "--help" || arg == "-h") {
             throw std::invalid_argument("help");
         } else {

@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "metrics/metrics.h"
 #include "runtime/config.h"
+#include "sched/sampling.h"
 
 namespace uma::sched {
 
@@ -22,6 +23,8 @@ class Scheduler {
     double decode_ms_ewma_;
     const double tick_budget_ms_ = 30.0;
     BaselinePolicy policy_;
+    TopPSampler sampler_;
+    std::mt19937 rng_ { std::random_device{}() };
 
   public:
     Scheduler(llama_context* ctx, const llama_vocab* vocab, const runtime::RuntimeConfig& cfg,

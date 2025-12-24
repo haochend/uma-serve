@@ -236,3 +236,9 @@ No cross-machine TP/PP; only request-parallel routing.
 No NPU offload complexities until we prove the serving wedge.
 
 Bottom line: UMA Serve is a runtime that makes one node feel like a small, low-tail LLM server for multiple local apps. It’s measurable, shippable in a month, and complementary to llama.cpp—exactly the kind of wedge that wins adoption without new kernels.
+
+—
+
+Addendum (v1.1) — Updated Priorities From Findings
+
+See docs/PRD_ADDENDUM.md for an up-to-date, findings-driven plan that refines goals, defaults (e.g., `--parallel 4`), ΣBMT guard scope, validation matrix, and success criteria.

@@ -144,7 +144,12 @@ std::string Metrics::to_json(uint32_t active_sessions, bool debug) const {
             << "\"last_decode_tokens\":" << last_decode_tokens.load(std::memory_order_relaxed) << ','
             << "\"last_prefill_tokens\":" << last_prefill_tokens.load(std::memory_order_relaxed) << ','
             << "\"max_batch_size_seen\":" << max_batch_size_seen.load(std::memory_order_relaxed) << ','
-            << "\"prefill_calls\":" << prefill_calls.load(std::memory_order_relaxed);
+            << "\"prefill_calls\":" << prefill_calls.load(std::memory_order_relaxed) << ','
+            // ΣBMT observability
+            << "\"bmt_units_last\":" << bmt_units_last.load(std::memory_order_relaxed) << ','
+            << "\"bmt_budget_units\":" << bmt_budget_units.load(std::memory_order_relaxed) << ','
+            << "\"bmt_guard_active\":" << (int) bmt_guard_active.load(std::memory_order_relaxed) << ','
+            << "\"bmt_guard_activations\":" << bmt_guard_activations.load(std::memory_order_relaxed);
     }
     oss << '}';
     return oss.str();

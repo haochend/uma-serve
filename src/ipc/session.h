@@ -51,6 +51,12 @@ struct ClientSession {
     uint64_t first_emit_ns = 0; // set on first generated piece
     uint64_t last_emit_ns = 0;  // updated on every generated piece
 
+    // Sampling preferences (per-request)
+    // Defaults choose a non-greedy sampler (temperature/top-p)
+    double temperature = 0.8; // 0.0 => greedy
+    double top_p = 0.95;      // 1.0 => no nucleus truncation
+    int32_t top_k = 0;        // 0 => disabled
+
     // Protocol: JSON-only (no mode field required)
     std::string request_id; // for JSON mode events
 };

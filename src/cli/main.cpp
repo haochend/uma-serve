@@ -23,6 +23,8 @@ struct CliOptions {
     int max_tokens = -1;
     double temperature = 0.0;
     double top_p = 1.0;
+    bool has_temperature = false;
+    bool has_top_p = false;
     bool stream = true;
     bool metrics = false;
 };
@@ -120,8 +122,8 @@ int main(int argc, char** argv) {
         else if (a == "--prompt" && need(i)) { opt.prompt = argv[++i]; }
         else if (a == "--id" && need(i)) { opt.id = argv[++i]; }
         else if (a == "--max-tokens" && need(i)) { opt.max_tokens = std::atoi(argv[++i]); }
-        else if (a == "--temp" && need(i)) { opt.temperature = std::atof(argv[++i]); }
-        else if (a == "--top-p" && need(i)) { opt.top_p = std::atof(argv[++i]); }
+        else if (a == "--temp" && need(i)) { opt.temperature = std::atof(argv[++i]); opt.has_temperature = true; }
+        else if (a == "--top-p" && need(i)) { opt.top_p = std::atof(argv[++i]); opt.has_top_p = true; }
         else if (a == "--no-stream") { opt.stream = false; }
         else if (a == "--metrics") { opt.metrics = true; }
         else {
@@ -152,8 +154,8 @@ int main(int argc, char** argv) {
         payload += std::string("\"stream\":") + (opt.stream ? "true" : "false");
         if (opt.max_tokens > 0) payload += ",\"max_tokens\":" + std::to_string(opt.max_tokens);
         // temperature/top_p are optional and may be ignored server-side for now
-        payload += ",\"temperature\":" + std::to_string(opt.temperature);
-        payload += ",\"top_p\":" + std::to_string(opt.top_p);
+        if (opt.has_temperature) payload += ",\"temperature\":" + std::to_string(opt.temperature);
+        if (opt.has_top_p) payload += ",\"top_p\":" + std::to_string(opt.top_p);
         payload += "}";
     }
 
@@ -225,4 +227,3 @@ int main(int argc, char** argv) {
     ::close(fd);
     return 0;
 }
-

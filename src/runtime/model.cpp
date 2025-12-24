@@ -45,8 +45,8 @@ static llama_context_params make_context_params(const RuntimeConfig& cfg) {
         cp.n_threads = cfg.n_threads;
         cp.n_threads_batch = cfg.n_threads;
     }
-    // enable multi-sequence for batching: align with max_sessions
-    cp.n_seq_max = std::max<uint32_t>(cfg.max_sessions, 1);
+    // enable multi-sequence for batching: align with configured parallel sequences
+    cp.n_seq_max = std::max<uint32_t>(cfg.n_seq_max, 1);
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     cp.offload_kqv = cfg.offload_kqv; // let backend move KQV to device if capable
     cp.kv_unified = cfg.kv_unified;   // persistent unified KV allocator buffer

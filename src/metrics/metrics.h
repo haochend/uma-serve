@@ -47,6 +47,12 @@ struct Metrics {
     std::atomic<uint64_t> eval_calls{0};
     std::atomic<uint64_t> p_eval_calls{0};
 
+    // ΣBMT guard observability (experimental)
+    std::atomic<uint64_t> bmt_units_last{0};
+    std::atomic<uint64_t> bmt_budget_units{0};
+    std::atomic<uint32_t> bmt_guard_activations{0};
+    std::atomic<uint8_t> bmt_guard_active{0};
+
     // Write EWMA (ms) in fixed-point x1000
     void set_decode_ms_ewma(double ms);
     double get_decode_ms_ewma() const;
