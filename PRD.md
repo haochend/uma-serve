@@ -1,244 +1,403 @@
-UMA Serve — Product/Tech/Business Brief (Runtime-First)
-1) Executive summary
+# SwarmServe-MoE PRD (Apple Silicon, Big Local MoE)
 
-UMA Serve is a local, multi-app LLM runtime for Mac (Apple Silicon) and AMD UMA APUs that turns one machine into a small multi-tenant server. It does not change kernels; it orchestrates them better:
+## 1. One-Sentence Vision
 
-One weights map per node shared across apps.
+A lean, high-performance local inference runtime purpose-built for real agentic workloads on Apple Silicon, optimized for one very large text-only MoE model (for example MiniMax M2.5-class) serving 8-16+ concurrent agent loops with heavy tool calling and shared workspace.
 
-Token-level continuous batching with a latency guard.
+## 2. Product Thesis (Narrow and Explicit)
 
-BMT (Bytes-Moved-per-Token) budgeting to keep tail latency flat.
+SwarmServe-MoE is not a general local serving stack.
 
-Zero-copy logits + low-overhead IPC so the CPU sampler overlaps the next GPU token.
-We ship a daemon, light editor adapters, and a benchmark pack that proves tighter p95 and lower overhead vs stock local servers.
+It is a specialized runtime for the hardest local workload on Apple M silicon:
 
-2) Problem & target users
+- one huge text MoE model
+- multiple concurrent agent loops
+- tool-heavy short decode bursts
+- shared workspace state
+- strict memory/offload pressure
 
-Problem: Local LLM users (devs, small teams) run multiple apps (IDE, terminal, browser) on one machine. Stock servers batch greedily and use HTTP/JSON, so interactive latency spikes and memory is duplicated across processes.
+The goal is to improve agent-turn throughput and tail latency under MoE memory pressure, not just maximize single-stream tokens/sec.
 
-Who:
+## 3. Problem Statement (Validated)
 
-Individual Mac/AMD APU developers running local assistants/coders.
+Local multi-agent systems using large MoE models are bottlenecked by four coupled problems:
 
-Small teams with a Mac mini/Studio or mini-PC APUs acting as a shared box.
+- expert residency churn: different agents/roles activate different experts, causing page-in/page-out stalls
+- per-agent KV growth: 8-16 paused/resumed loops accumulate KV quickly
+- scheduler inefficiency: generic runtimes treat requests uniformly and can let long/background decodes monopolize progress
+- tool-heavy interaction pattern: frequent short turns and handoffs create high TTFT sensitivity and poor batching efficiency
 
-Tooling vendors that want a low-tail local backend.
+Result:
 
-3) Value proposition
+- thrashing / stalls / OOM before useful concurrency
+- weak agent-turn throughput despite high local memory bandwidth
+- poor p95 latency for high-priority steps (for example executor/critic)
 
-Snappy under load: Keep interactive p95 ≤ 1.2× solo baseline even while long jobs run.
+## 4. Solution & Core Value Proposition
 
-Higher throughput at the same latency cap: +30–60% tokens/s vs each-app-separate, via continuous micro-batching with a guard.
+Build **SwarmServe-MoE** as a thin, MoE-aware runtime layer on top of `llama.cpp` that adds:
 
-Lower overhead: −5–15% TTFT, −10–20% CPU, ≈0 copies/token by using UDS + zero-copy logits.
+- MoE expert residency management and speculative prefetch
+- offload-aware preemptive continuous batching
+- paged KV arena with fast pause/resume
+- shared-workspace prompt/prefix reuse (not naive universal KV sharing)
+- an agent-step API that can carry scheduling metadata when available
 
-Lower memory: 1× model RSS for N apps (one weights map), not N×.
+Differentiation:
 
-4) Scope (runtime only)
+- Existing Apple-local runtimes can improve batching and KV behavior.
+- SwarmServe-MoE is specifically optimized for MoE expert residency/offload behavior under agent concurrency.
 
-In scope (v1):
+## 5. Target Scope (Apple M Silicon Only for v0.x)
 
-Daemon (“umad”) embedding llama.cpp backends (Metal, Vulkan/HIP).
+### Primary Target
 
-Scheduler: continuous batching, latency guard, ΣBMT budget, QoS lanes, token-boundary preemption, session pinning.
+- Hardware: Apple M silicon only (start with one tested machine/config, e.g. M4 Max or M4 Ultra)
+- Backend: Metal / UMA only
+- Model class: one large text-only MoE at a time (MiniMax M2.5-class first, or closest available compatible path)
+- Workload: 8-16 concurrent tool-using agent loops with mixed priorities
+- Deployment: single machine only
 
-Zero-copy logits path (shared buffer the CPU sampler reads in-place).
+### Non-Goals (v0.x)
 
-UDS/Named-pipe IPC + thin HTTP gateway (optional, not in hot path).
+- dense-model optimization as a primary goal
+- multimodal (vision/audio/video)
+- distributed / multi-node inference
+- multi-model serving/router mode
+- training or fine-tuning
+- full agent framework integration (API only)
+- full OpenAI API parity in MVP
 
-KV manager (layout packing, optional KV quant selection; wiring, not kernels).
+## 6. Key Design Principles (from Discussion)
 
-Scorecard metrics and reproducible benchmarks.
+### 6.1 Differentiation Priority Is Not the Same as Execution Order
 
-Out of scope (v1):
+Feature priority in this PRD is based on expected improvement over existing Apple-local solutions for large-MoE agent workloads, not implementation ease.
 
-Kernel rewrites/fusions beyond what llama.cpp provides.
+Roadmap sequencing may differ due to dependencies, instrumentation, and correctness requirements.
 
-Cross-box TP/PP. (We support request-parallel scaling via a simple router.)
+### 6.2 Foundational vs Differentiating Features
 
-NPU offload (optional later; CPU sampler first).
+`continuous batching` and `paged KV` are important and likely foundational on Apple Silicon. They are not "optional."
 
-5) Architecture (high level)
+However, the unique product wedge for large local MoE workloads is MoE-specific memory/offload control:
 
-Per node:
+- expert residency policies
+- prefetch hit rate
+- reduced expert page-in stalls
 
-umad process:
+### 6.3 Metadata-Dependent Scheduling Must Be Explicit
 
-Loads model once (read-only mapping).
+True role-aware scheduling requires clients/agents to send metadata such as:
 
-Allocates persistent pools/argument buffers (no per-token allocs).
+- `role`
+- `priority`
+- `resume_id`
+- optional `deadline_ms` / latency class
 
-Exposes UDS API and optional HTTP gateway.
+Without that metadata, the runtime still benefits from:
 
-Runs the scheduler loop (ready queue → token-merge under guard & BMT budget).
+- preemptive batching core
+- heuristic prioritization
+- short-step bias
 
-Writes logits to a shared buffer; CPU sampler (BNNS/xnnpack) consumes in-place while GPU starts next token.
+But it should not claim full role-aware policy behavior.
 
-Clients (IDE plugin, CLI, agents) connect via UDS; server streams tokens (SSE or framed UDS messages).
+### 6.4 Prefill and Decode Need Different MoE Strategies
 
-Multi-node:
+Long prefills behave differently from decode/resume:
 
-Optional coordinator (router) that places sessions on nodes by p95 headroom and ΣBMT; sessions are sticky.
+- large prefill chunks can cause per-layer expert unions to approach "most experts"
+- this reduces the value of speculative expert prefetch and can collapse into layer-like traffic
 
-6) Core features (v1)
+Implication:
 
-Continuous batching + latency guard
+- speculative expert prefetch is a **decode/resume optimization first**
+- prefill optimization focuses on **chunked prefill + reactive expert copy + prompt/prefix caching**
+- chunked prefill may enable rolling chunk-to-chunk expert prefetch if expert-union saturation stays low
 
-Token-level coalescing (2–8) with p95 cap (default 1.20× of solo baseline).
+## 7. Feature Priorities (Differentiation-First)
 
-Token-boundary preemption to insert interactive tokens.
+### P1. MoE Expert Residency Manager + Speculative Prefetch (Decode/Resume First)
 
-BMT budgeting
+Goal:
 
-Compute per-request bytes moved per token (weights slice est., KV, intermediates).
+- reduce expert page-in stall time under multi-agent MoE concurrency
+- keep likely experts hot using role/history/routing signals
 
-Enforce a ΣBMT budget (GB/s) to avoid saturating UMA bandwidth; throttle background flows.
+Capabilities:
 
-Zero-copy logits & overlapped sampling
+- expert hotness tracking by role and recent requests
+- residency policy and memory budget
+- async prefetch queue (Metal)
+- decode/resume-first prefetch policy (`bs1` and short-step agent workloads)
+- predictor modes:
+  - heuristic-first (MVP-safe)
+  - gating/hidden-state informed (experimental / later)
 
-Shared buffer (Metal StorageModeShared / Vulkan HOST_VISIBLE / HIP pinned) for logits.
+Validation note:
 
-CPU sampler reads in place while GPU starts the next token.
+- prefill-side speculative prefetch is not assumed to help until chunk-size and expert-union data prove it.
 
-KV manager (runtime wiring)
+### P2. Offload-Aware Preemptive Continuous Batching
 
-Switch for KV layout (head-major) and KV precision (fp16/q8/q6) using llama.cpp hooks.
+Goal:
 
-Page pre-touch hooks (optional) and persistent pools (no per-token allocs).
+- maximize agent-turn throughput while protecting latency for short/high-priority steps
 
-Low-overhead IPC
+Capabilities:
 
-Unix domain sockets (or Windows named pipes later).
+- token-level or short-quantum scheduling
+- preemption at safe boundaries
+- fairness/starvation guardrails
+- offload-aware scheduling signals (queue cost, expected memory movement)
 
-Optional OpenAI-compatible HTTP gateway for tools that need it (not hot path).
+### P3. Paged KV Arena + Chunked Prefill + Prefix Reuse
 
-Scorecard & observability
+Goal:
 
-/metrics JSON and CSV logs: tokens/s @ p95 cap, p95/p99, ΣBMT, scheduler efficiency, copy-free ratio, GPU-idle%, residency-churn/token, TTFT, RSS.
+- sustain more paused/resumed agents without thrash
+- reduce TTFT and prompt rebuild cost for shared prefixes
+- make long prefill schedulable and compatible with MoE offload constraints
 
-7) APIs & CLI (developer-friendly)
+Capabilities:
 
-CLI
+- KV block allocator
+- pause/resume persistence
+- eviction policy
+- chunked prefill execution (small chunk sizes with scheduler control points)
+- chunk-level expert-union telemetry (to decide if rolling prefetch is worth enabling)
+- exact token-prefix cache with memory cap + telemetry
 
-umad serve \
-  --model qwen-coder-30b-q8.gguf \
-  --latency-cap 1.20 \
-  --bmt-budget 320GBps \
-  --kv-type f16|q8|q6 \
-  --kv-pack head-major \
-  --ipc uds \
-  --http off
+Note:
 
+- "shared workspace" does not imply generic KV sharing; reuse is prefix/token compatibility dependent.
 
-Runtime config (YAML)
+### P4. Agent API & Tooling
 
-latency_cap: 1.20
-bmt_budget_gbps: 320
-qos:
-  interactive: {priority: 10}
-  background:  {priority: 1}
-scheduler:
-  max_merge: 4
-  preempt_at_token: true
-logging:
-  scorecard_interval_s: 5
+Goal:
 
+- enable metadata-rich scheduling when available without blocking core runtime gains
 
-Endpoints
+Capabilities:
 
-POST /generate (SSE stream, or UDS framed)
+- `/agent-step` endpoint with metadata
+- minimal OpenAI-compatible shim later
+- tool result fast-path (zero-copy server buffers + token/prefix cache reuse where compatible)
 
-POST /load, POST /unload
+## 8. Execution Plan (Dependency / Risk Managed)
 
-GET /metrics (scorecard JSON)
+Execution uses two tracks:
 
-POST /priority (promote/demote session QoS)
+- `Track A (Differentiation)`: decode/resume expert-prefetch validation and MoE residency work
+- `Track B (Foundation)`: continuous batching policy, paged KV, chunked prefill, prompt cache
 
-Metrics JSON (excerpt)
+Continuous batching is not a separate "later" feature. It is the foundation layer for all phases below.
 
-{
-  "model":"qwen-coder-30b-q8",
-  "tokens_per_s_at_cap": 88.4,
-  "latency_cap": 1.20,
-  "p95_ms": 57.2, "p99_ms": 85.1,
-  "sum_bmt_mb_per_token": 312.0,
-  "scheduler_efficiency": 0.86,
-  "copy_free_ratio": 0.97,
-  "gpu_idle_pct": 4.3,
-  "residency_churn_mb_per_token": 0.0,
-  "rss_gb": 31.1
-}
+### Phase 0: Baseline and Measurement Contract (2-3 days)
 
-8) Benchmarks we will publish (release blog)
+- pick one exact target: hardware, macOS version, model, quantization, backend build, prompt template
+- define "thrash" and "stall" thresholds
+- implement benchmark harness for 4/8/16-agent scenarios
+- record baseline on stock `llama.cpp` server
+- measure prefill chunk-size sensitivity (throughput and latency) on the target model
+- measure per-layer expert-union growth vs prefill chunk size (`16/32/64/128`)
 
-A) Mixed-load SLO (3 interactive + 1 long-ctx)
-Compare LM Studio / llama.cpp server (CB on) vs UMA Serve on the same box.
-Report: tokens/s @ p95 cap, p95/p99 per client, ΣBMT, scheduler efficiency, RSS, GPU-idle%.
-Goal: hold interactive p95 ≤ 1.2×, aggregate tokens/s +30–60% vs each-app-separate; near-parity throughput vs stock server but flatter tails; RSS ~1× model.
+Required outputs:
 
-B) Long-context KV sweep (16k/32k)
-KV fp16→q8→q6 with head-major packing.
-Report: tokens/s vs ΣBMT; show throughput tracks bytes.
-Goal: +15–40% tokens/s at long T by cutting KV bytes (platform-dependent).
+- TTFT, inter-token latency p50/p95/p99, turns/sec, memory footprint, stall counters
+- expert-copy bytes/time and expert-union-per-layer-per-chunk (for MoE paths)
 
-C) Overhead microbench
-UDS+zero-copy vs HTTP/JSON on single stream.
-Goal: TTFT −5–15%, CPU −10–20%, copies/token ≈ 0.
+### Phase 1: Decode/Resume Expert-Prefetch Validation Spike (5-7 days, Track A)
 
-9) Competitive positioning
+- instrument MoE expert routing / selected expert IDs on the target model path
+- run `bs1` decode and short-step agent traces to validate expert locality and stall behavior
+- implement heuristic expert prefetch (feature-flagged) for decode/resume only
+- compare `none` vs `layer` vs `expert` prefetch behavior (stall time, ITL, tok/s)
 
-Versus LM Studio / stock llama.cpp server: Both have CB; we add SLO enforcement (latency guard + BMT budget), token preemption, UDS/zero-copy path, and single-map multi-app UX with a public scorecard. Result: tighter tails under mixed load and lower system overhead.
+Why first:
 
-Versus vLLM/sglang on GPUs: Those win at peak throughput and TP/PP. We interoperate (optional router) and own the local, low-tail, multi-app wedge on UMA nodes.
+- validates the highest-differentiation hypothesis before deeper runtime changes
+- avoids over-investing in a prefetch system that may not pay off on target workloads
 
-10) Risks & mitigations
+### Phase 1B: Continuous Batching Foundation Upgrades (parallel/overlapping, Track B)
 
-Small or no wins vs tuned stock server → Make p95-at-cap the north-star, not raw T/s; publish mixed-load SLO results.
+- strengthen preemptive continuous batching (works without role metadata)
+- add short-step bias, fairness/starvation guardrails, and queue telemetry
+- treat prefill chunks as schedulable units (not monolithic prefill bursts)
+- expose scheduler counters needed by Track A experiments
 
-Driver/SDK quirks (AMD Vulkan/HIP coherence) → Use conservative barriers; zero-copy only for small tensors; keep HTTP gateway as fallback.
+### Phase 2: Paged KV Arena + Chunked Prefill (7-10 days, Track B)
 
-Feature creep into kernels → Guardrail: no kernel edits in v1; rely on llama.cpp knobs (KV type/layout).
+- KV block allocator and resume path
+- chunked prefill controller (start with small chunk sizes if throughput remains flat-ish)
+- resume latency and prefill interruptibility telemetry
+- optional rolling chunk-union prefetch experiment (only if expert-union saturation stays bounded)
 
-Adoption friction → Homebrew installer, LaunchAgent/Service, one-click VS Code/Zed adapters.
+### Phase 3: Aggressive Prompt/Prefix Caching (5-7 days, Track B)
 
-11) Delivery plan
+- exact token-prefix cache with memory cap + LRU eviction
+- shared workspace/system prompt prefix reuse
+- cache hit/miss telemetry and TTFT attribution
+- aggressive cache policy tuning for agent swarm workloads (warm/cold reporting required)
 
-Week 1–2:
+### Phase 4: MoE Residency Manager Productization + Metadata-Rich Policy (ongoing)
 
-UDS server + SSE gateway; session model loading; continuous batching with latency cap; basic scorecard; Homebrew formula.
+- expand decode prefetch from validation spike to runtime residency manager
+- expert hotness tables by role/request class
+- residency budget and eviction
+- async Metal prefetch queue with latency guard / budget throttling
+- role-aware scheduling policy when clients send metadata
+- gating/hidden-state informed predictor if hooks are available
+- upstream minimal hooks to `llama.cpp`
+- OpenAI compatibility shim and examples
 
-Week 3:
+Detailed milestone sequencing and engineering tasks live in `docs/ENGINEERING_ROADMAP_MOE.md`.
 
-ΣBMT estimator + budget governor; token-boundary preemption; zero-copy logits path; CPU sampler overlap; KV layout/quant wiring.
+## 9. API Surface (MVP and Forward-Compatible)
 
-Week 4:
+### Core Endpoint (MVP)
 
-Bench harness + three publishable charts; VS Code/Zed adapter; docs & samples.
+`POST /agent-step`
 
-Go/No-Go gate: Mixed-load benchmark shows p95 ≤ 1.2× with ≥30% aggregate throughput gain vs each-app-separate and flat RSS. If not, iterate on scheduler/IPC, not kernels.
+Required request fields (MVP):
 
-12) Open questions
+- `agent_id`
+- `workspace_id`
+- `messages` or prompt payload
 
-Minimum macOS/driver versions for stable shared-buffer handoff? (We’ll document tested combos.)
+Optional scheduling metadata (enables role-aware policy):
 
-Default ΣBMT budget per platform (derive from simple roofline or probe at boot).
+- `role`
+- `priority`
+- `resume_id`
+- `deadline_ms`
+- `latency_class`
+- `shared_prefix_id`
 
-Whether to expose per-client soft SLOs (e.g., 1.1× vs 1.3×) and dynamic reprioritization from adapters.
+### Compatibility Notes
 
-AMD first backend: Vulkan (portable) vs HIP (perf on Linux)? (Start with Vulkan + HOST_VISIBLE logits.)
+- Runtime provides value without metadata via generic preemptive scheduling.
+- Full role-aware claims require client support for metadata.
 
-13) What we will not do (to stay focused)
+## 10. Success Metrics (Apple M + Big-MoE Specific)
 
-No kernel fusion work in v1 (keep to llama.cpp).
+### Primary Product Metrics
 
-No cross-machine TP/PP; only request-parallel routing.
+- agent turns/sec at 8 and 16 concurrent loops
+- `agent-step` latency p50/p95/p99 (overall and by role when metadata is present)
+- sustained no-thrash operating point (30+ minute run, no OOM/runaway stalls)
 
-No NPU offload complexities until we prove the serving wedge.
+### Latency and Streaming Metrics (must report)
 
-Bottom line: UMA Serve is a runtime that makes one node feel like a small, low-tail LLM server for multiple local apps. It’s measurable, shippable in a month, and complementary to llama.cpp—exactly the kind of wedge that wins adoption without new kernels.
+- TTFT p50/p95
+- inter-token latency (ITL/TBT) p50/p95/p99
+- decode-only throughput and end-to-end throughput (reported separately)
 
-—
+### MoE / Memory Metrics (differentiation metrics)
 
-Addendum (v1.1) — Updated Priorities From Findings
+- expert prefetch hit rate
+- expert page-in stall time (ms/turn, ms/token)
+- offload bytes/sec and read amplification
+- KV resume overhead (ms)
+- cache hit/miss rate (prefix cache, KV resume path)
+- SSD stall percentage (if disk-backed offload is used)
+- per-layer unique experts per prefill chunk (chunk-size sweep)
+- chunked prefill interruptibility / pause overhead
 
-See docs/PRD_ADDENDUM.md for an up-to-date, findings-driven plan that refines goals, defaults (e.g., `--parallel 4`), ΣBMT guard scope, validation matrix, and success criteria.
+### Scheduler Quality Metrics
+
+- fairness/starvation incidents
+- queue wait time by class
+- preemption count and resume success rate
+
+## 11. Benchmark Methodology (Required for Credible Claims)
+
+This section is mandatory for any benchmark claim in release docs or PRs.
+
+### 11.1 Baselines (Apple-Specific)
+
+At minimum:
+
+- `llama.cpp` server (matched model, quantization, context, and generation settings)
+
+If feasible on the same hardware/model path:
+
+- an MLX-based local server/runtime
+- MLC-LLM (or comparable Apple-focused runtime)
+
+### 11.2 Reporting Rules
+
+Always report:
+
+- hardware (exact Apple chip, RAM, storage)
+- macOS version
+- Xcode/Metal toolchain version (if relevant)
+- `llama.cpp` commit and SwarmServe-MoE commit
+- model name + quantization + template
+- prompt length / output length distributions
+- concurrency level and workload mix
+- warm vs cold runs
+- number of trials and variance/error bars
+
+### 11.3 Workload Classes (to prevent cherry-picking)
+
+- unique prompts (prompt cache disabled or neutralized)
+- shared-prefix prompts (agent workspace/system prompt reuse)
+- tool-heavy short-turn workloads
+- long-context stress workloads
+- mixed-priority agent loops (when metadata is available)
+
+### 11.4 Metric Boundaries
+
+Define and report exact measurement boundaries for:
+
+- TTFT (client-perceived)
+- inter-token latency
+- decode-only throughput
+- end-to-end throughput
+- cache warm/cold state
+
+## 12. Architecture (High-Level)
+
+```text
+SwarmServe-MoE
+├── external/llama.cpp/             # upstream submodule (minimal hooks only)
+├── core/                           # C++ hot path
+│   ├── moe_residency_manager.cpp   # expert hotness, residency policy, prefetch queue
+│   ├── preemptive_batcher.cpp      # preemption, fairness, scheduling lanes
+│   ├── paged_kv_arena.cpp          # KV blocks, eviction, pause/resume
+│   ├── prefix_cache.cpp            # exact token-prefix cache + LRU budget
+│   └── telemetry.cpp               # stall, queue, cache, latency metrics
+├── server/                         # thin control plane (C++ or Python)
+│   └── agent_step_api.*            # /agent-step, metadata handling, tool dispatch
+├── agents/                         # examples only (not a framework)
+└── benchmarks/                     # reproducible swarm workloads and traces
+```
+
+## 13. Risks and Assumptions
+
+### Key Assumptions
+
+- target MoE model is runnable via a `llama.cpp`-compatible path on Apple Metal
+- a single-model deployment is sufficient for product validation
+- role metadata may not be available initially from existing agent clients
+
+### Risks
+
+- `llama.cpp` internal API churn complicates hooks
+- predictor accuracy is weak at first, reducing prefetch gains
+- prefetch can regress latency if it contends with active decode
+- benchmark comparability is difficult across runtimes if templates/settings differ
+
+### Mitigations
+
+- keep upstream patches minimal and generic
+- ship heuristic predictor first with feature flags
+- instrument prefetch hit/miss and disable automatically if regressions are detected
+- publish strict benchmark configs and scripts
+
+## 14. References (for Scope and Bench Methodology)
+
+- `arXiv:2601.19139` (Apple Silicon local serving / prefix cache findings)
+- `arXiv:2511.05502` (Apple Silicon runtime comparisons, batching/paged-KV/latency methodology)
